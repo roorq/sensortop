@@ -11,12 +11,12 @@ Settings, chip aliases and the list of manually hidden sensors live in
 ~/.config/sensortop/config.toml (the `W` key saves the current state).
 
 Usage:
-    ./sensortop.py                # TUI, refresh every 2 s
-    ./sensortop.py -i 1           # refresh every 1 s
-    ./sensortop.py -1             # one-off text dump (no TUI)
-    ./sensortop.py -1 --json      # normalised JSON on stdout (alerting)
-    ./sensortop.py --demo         # synthetic data (no lm-sensors)
-    ./sensortop.py -f             # degrees Fahrenheit
+    ./sensortop                # TUI, refresh every 2 s
+    ./sensortop -i 1           # refresh every 1 s
+    ./sensortop -1             # one-off text dump (no TUI)
+    ./sensortop -1 --json      # normalised JSON on stdout (alerting)
+    ./sensortop --demo         # synthetic data (no lm-sensors)
+    ./sensortop -f             # degrees Fahrenheit
 """
 
 from __future__ import annotations
@@ -767,10 +767,10 @@ DEFAULT_ALIASES = [
     ("drivetemp-*", "disk"),
     ("spd5118-*", "RAM"),
     ("jc42-*", "RAM"),
-    ("nct6*", "board"),
-    ("it87*", "board"),
-    ("it86*", "board"),
-    ("asus*", "board"),
+    ("nct6*", "motherboard"),
+    ("it87*", "motherboard"),
+    ("it86*", "motherboard"),
+    ("asus*", "motherboard"),
     ("r8169*", "NIC PHY"),
     ("igb-*", "NIC"),
     ("iwlwifi*", "WiFi"),
@@ -816,6 +816,13 @@ CONFIG_PATH = os.path.join(CONFIG_DIR, "config.toml")
 LEGACY_ALIASES = os.path.join(CONFIG_DIR, "aliases.conf")
 
 
+def migrate_alias(alias: str) -> str:
+    """Translate the old motherboard alias stored by earlier configurations."""
+    if alias.strip().casefold() in ("płyta", "plyta"):
+        return "motherboard"
+    return alias
+
+
 def load_aliases(path: str = LEGACY_ALIASES) -> list[tuple[str, str]]:
     """Loads `pattern = alias` from the old aliases.conf file (# is a comment)."""
     rules: list[tuple[str, str]] = []
@@ -828,7 +835,7 @@ def load_aliases(path: str = LEGACY_ALIASES) -> list[tuple[str, str]]:
                 pat, alias = line.split("=", 1)
                 pat, alias = pat.strip(), alias.strip()
                 if pat and alias:
-                    rules.append((pat, alias))
+                    rules.append((pat, migrate_alias(alias)))
     except OSError:
         pass
     return rules
@@ -889,8 +896,9 @@ class Config:
         cfg.temps = _typed(raw.get("temps"), TEMP_SETTINGS)
         aliases = raw.get("aliases")
         if isinstance(aliases, dict):
-            cfg.aliases = [(str(k), str(v)) for k, v in aliases.items() if k and v]
-        hidden = (raw.get("hidden") or {}).get("sensors")
+            cfg.aliases = [(str(k), migrate_alias(str(v))) for k, v in aliases.items() if k and v]
+        hidden_section = raw.get("hidden")
+        hidden = hidden_section.get("sensors") if isinstance(hidden_section, dict) else None
         if isinstance(hidden, list):
             cfg.hidden = [str(x) for x in hidden if x]
         prio = raw.get("priorities") or raw.get("priorytety")  # legacy PL name
@@ -1020,7 +1028,9 @@ def _toml_val(v) -> str:
         return repr(v)
     if isinstance(v, (list, tuple)):
         return "[" + ", ".join(_toml_val(x) for x in v) + "]"
-    return '"' + str(v).replace("\\", "\\\\").replace('"', '\\"') + '"'
+    # JSON string escapes also work in TOML basic strings, including control
+    # characters that cannot be written literally into a single-line string.
+    return json.dumps(str(v), ensure_ascii=False).replace("\x7f", "\\u007f")
 
 
 class ChipNamer:
@@ -3189,7 +3199,58 @@ def resolve_settings(args, cfg: Config) -> None:
 # ---------------------------------------------------------------------------
 
 
+def set_proc_name(name: str = "sensortop") -> None:
+    """Rename the process itself.
+
+    Terminals such as Konsole label the tab with the name of the foreground
+    process (/proc/<pid>/comm), which for a script is `python3` - that is why
+    setting the window title alone is not enough. `setproctitle` (optional)
+    additionally fixes what `ps` and `pgrep` show.
+    """
+    try:
+        import ctypes
+
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        buf = ctypes.create_string_buffer(name.encode()[:15])  # comm is 16 bytes
+        libc.prctl(15, ctypes.byref(buf), 0, 0, 0)  # 15 = PR_SET_NAME
+    except Exception:
+        pass
+    try:
+        import setproctitle  # type: ignore
+
+        setproctitle.setproctitle(name)
+    except Exception:
+        pass
+
+
+def set_term_title(title: str) -> None:
+    """Name the terminal window/tab (otherwise it shows just `python`)."""
+    if not sys.stdout.isatty() or os.environ.get("TERM", "dumb") == "dumb":
+        return
+    try:
+        sys.stdout.write("\033[22;0t")           # push the current title
+        sys.stdout.write(f"\033]0;{title}\007")  # set icon name + window title
+        sys.stdout.flush()
+    except OSError:
+        pass
+
+
+def restore_term_title() -> None:
+    """Put back the title that was on screen before we took over."""
+    if not sys.stdout.isatty() or os.environ.get("TERM", "dumb") == "dumb":
+        return
+    try:
+        sys.stdout.write("\033[23;0t")  # pop the saved title
+        sys.stdout.flush()
+    except OSError:
+        pass
+
+
+# ---------------------------------------------------------------------------
+
+
 def main(argv=None) -> int:
+    set_proc_name("sensortop")
     ap = argparse.ArgumentParser(
         prog="sensortop",
         description="A btop-style temperature monitor built on lm-sensors.",
@@ -3332,7 +3393,7 @@ def main(argv=None) -> int:
     err = source.available()
     if err:
         print(err, file=sys.stderr)
-        print("Hint: run `sensortop.py --demo` to see the interface.", file=sys.stderr)
+        print("Hint: run `sensortop --demo` to see the interface.", file=sys.stderr)
         return 2
 
     if args.write_config:
@@ -3342,10 +3403,13 @@ def main(argv=None) -> int:
         return once(source, args, cfg)
 
     app = App(source, args, cfg)
+    set_term_title("sensortop")
     try:
         curses.wrapper(app.run)
     except KeyboardInterrupt:
         pass
+    finally:
+        restore_term_title()
     return 0
 
 
