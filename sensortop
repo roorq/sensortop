@@ -1,0 +1,3491 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+sensortop - a btop-style temperature monitor built on lm-sensors.
+
+Reads the output of `sensors -j` (falling back to plain text), draws
+gradient bars in the terminal, a braille history chart and min/max/avg
+statistics for the selected sensor.
+
+Settings, chip aliases and the list of manually hidden sensors live in
+~/.config/sensortop/config.toml (the `W` key saves the current state).
+
+Usage:
+    ./sensortop                # TUI, refresh every 2 s
+    ./sensortop -i 1           # refresh every 1 s
+    ./sensortop -1             # one-off text dump (no TUI)
+    ./sensortop -1 --json      # normalised JSON on stdout (alerting)
+    ./sensortop --demo         # synthetic data (no lm-sensors)
+    ./sensortop -f             # degrees Fahrenheit
+"""
+
+from __future__ import annotations
+
+import argparse
+import curses
+import fnmatch
+import glob
+import json
+import locale
+import math
+import os
+import random
+import re
+import socket
+import subprocess
+import sys
+import time
+from dataclasses import dataclass, field
+from typing import NamedTuple, Optional
+
+VERSION = "1.2"
+
+# Units keyed by the prefix in `sensors -j` (temp1_input, fan2_input, in0_input...)
+KIND_UNITS = {
+    "temp": "°C",
+    "fan": "RPM",
+    "freq": "Hz",  # hwmon reports raw Hz - we format it as MHz/GHz
+    "in": "V",
+    "power": "W",
+    "curr": "A",
+    "energy": "J",
+    "humidity": "%",
+}
+
+KIND_ORDER = {
+    "temp": 0,
+    "fan": 1,
+    "freq": 2,
+    "power": 3,
+    "curr": 4,
+    "in": 5,
+    "energy": 6,
+}
+
+# Default upper references, used when the driver reports no limit at all.
+PUMP_HINTS = ("pump", "aio", "wc_")
+DEFAULT_FAN_TOP = 2000.0  # case fan
+DEFAULT_PUMP_TOP = 6000.0  # AIO pump
+# Voltages: the lowest rail that fits the reading (1.24 V -> scale 0..1.5 V)
+VOLT_LADDER = (1.5, 3.3, 5.0, 12.0, 24.0)
+
+# Labels that are not a real measuring point (PECI/TSI calibration offsets)
+JUNK_LABELS = ("*calibration*", "*calib offset*")
+
+# Hard physical temperature range; outside it a reading is certainly bogus.
+# The lower bound is only a last resort - normally the floor is computed
+# dynamically from the trustworthy sensors (see dynamic_floor).
+TEMP_PHYSICAL = (5.0, 130.0)
+
+# Dynamic lower floor: how many degrees below the coldest trustworthy sensor
+# readings start counting as bogus, and how high that floor may climb.
+TEMP_FLOOR_MARGIN = 10.0  # °C
+TEMP_FLOOR_CAP = 25.0  # °C - no higher, so a cold but real sensor survives
+
+# History: a fixed-length ring buffer, allocated once per sensor.
+# 900 samples is 30 minutes at the default 2 s - at another interval the
+# capacity stays the same and the time it covers changes (the panels derive
+# that from the interval, so no unsupported "30 min" is ever printed).
+HISTORY_CAP = 900
+
+# Time windows of the history panel: how many samples go into one bucket.
+# At 2 s that gives, in order: the raw sample, 30 s and 5 min.
+WINDOWS = (1, 15, 150)
+
+# How many series of each kind the dual-axis panel holds before it turns into
+# a tangle of lines (nct6799 can report 6 fans and 8 temperatures).
+DUAL_MAX = 4
+
+# Duplicate detection (the same measurement read through two paths)
+DUPE_TOLERANCE = 0.5  # the instantaneous difference must be SMALLER than this, °C
+DUPE_MIN_SAMPLES = 20  # below this we flag nothing - absence of data is not proof
+DUPE_AGREEMENT = 0.9  # what fraction of samples must fall within the tolerance
+DUPE_WINDOW = 120  # upper limit of "the last N samples" (at 2 s about 4 minutes)
+
+# ---------------------------------------------------------------------------
+# Data model
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class Reading:
+    """A single sensor reading."""
+
+    chip: str
+    adapter: str
+    label: str
+    kind: str
+    value: float
+    high: Optional[float] = None
+    crit: Optional[float] = None
+    low: Optional[float] = None
+    unit: str = ""
+    error: Optional[str] = None  # e.g. no *_input, or a read error from hwmon
+
+    @property
+    def key(self) -> str:
+        """Sensor identity: (adapter, chip, label).
+
+        The label alone identifies nothing - every RAM stick and every PHY
+        carries a `temp1`. The adapter and the chip have to be part of the
+        key so two sensors with the same name never share one history.
+        """
+        return f"{self.adapter}\x00{self.chip}\x00{self.label}"
+
+    @property
+    def valid(self) -> bool:
+        return self.error is None and not math.isnan(self.value)
+
+
+class Ring:
+    """A fixed-capacity ring buffer - the list is allocated once, on creation.
+
+    The memory per sensor is known up front (`cap` slots) and does not depend
+    on how long the program runs: once full, the oldest sample is overwritten
+    in place, with no `append`/`pop` and no reallocation of the list.
+
+    The interface deliberately matches a list in the few places the rest of the
+    program uses (`len`, iteration, `clear`), so the renderers accept both the
+    buffer and a plain list from a test. `tail(n)` is a faster route to "the
+    last n samples" than `list(...)[-n:]`, which copies the whole buffer.
+    """
+
+    __slots__ = ("buf", "cap", "pos", "n")
+
+    def __init__(self, cap: int = HISTORY_CAP):
+        self.cap = max(1, int(cap))
+        self.buf = [0.0] * self.cap  # preallocated - from here on only slot swaps
+        self.pos = 0  # index the next sample goes into
+        self.n = 0  # how many slots are actually filled
+
+    def append(self, v: float) -> None:
+        self.buf[self.pos] = v
+        self.pos = (self.pos + 1) % self.cap
+        if self.n < self.cap:
+            self.n += 1
+
+    def clear(self) -> None:
+        self.pos = self.n = 0
+
+    def tail(self, k: int) -> list:
+        """The last k samples in chronological order (a copy)."""
+        k = min(max(int(k), 0), self.n)
+        if k == 0:
+            return []
+        start = (self.pos - k) % self.cap
+        end = start + k
+        if end <= self.cap:
+            return self.buf[start:end]
+        return self.buf[start:] + self.buf[: end - self.cap]
+
+    def __len__(self) -> int:
+        return self.n
+
+    def __iter__(self):
+        return iter(self.tail(self.n))
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging only
+        return f"Ring({self.n}/{self.cap})"
+
+
+def tail_of(series, n: int) -> list:
+    """The last n items - from a `Ring` without copying it all, from a list plainly."""
+    fast = getattr(series, "tail", None)
+    return fast(n) if fast is not None else list(series)[-n:] if n > 0 else []
+
+
+class Bucket(NamedTuple):
+    """A bucket of an aggregated window: the extremes and mean of several samples."""
+
+    lo: float
+    avg: float
+    hi: float
+
+
+def aggregate(series, bucket: int) -> list:
+    """Splits a series into buckets of `bucket` samples: (min, mean, max).
+
+    The split runs from the end: the newest sample always closes the last
+    bucket, so the panel reacts to the current reading and the incomplete
+    remainder lands on the left - where the oldest history sits anyway. The
+    other way round (splitting from the start) the last bucket grows in front
+    of the user and jumps once it closes.
+    """
+    data = list(series)
+    if bucket <= 1:
+        return [Bucket(v, v, v) for v in data]
+    out = []
+    edge = len(data) % bucket
+    if edge:
+        head = data[:edge]
+        out.append(Bucket(min(head), sum(head) / edge, max(head)))
+    for i in range(edge, len(data), bucket):
+        chunk = data[i : i + bucket]
+        out.append(Bucket(min(chunk), sum(chunk) / bucket, max(chunk)))
+    return out
+
+
+def fmt_span(seconds: float) -> str:
+    """The window duration in a form that fits the panel frame."""
+    if seconds < 60:
+        return f"{seconds:g}s"
+    if seconds < 3600:
+        m = seconds / 60
+        return f"{m:g} min" if m == int(m) else f"{m:.1f} min"
+    h = seconds / 3600
+    return f"{h:g} h" if h == int(h) else f"{h:.1f} h"
+
+
+@dataclass
+class Stats:
+    """History and session statistics for a single sensor."""
+
+    hist: Ring = field(default_factory=Ring)
+    vmin: float = math.inf
+    vmax: float = -math.inf
+    total: float = 0.0
+    count: int = 0
+
+    def push(self, v: float) -> None:
+        self.hist.append(v)
+        self.vmin = min(self.vmin, v)
+        self.vmax = max(self.vmax, v)
+        self.total += v
+        self.count += 1
+
+    @property
+    def avg(self) -> float:
+        return self.total / self.count if self.count else 0.0
+
+    def reset(self) -> None:
+        self.vmin = math.inf
+        self.vmax = -math.inf
+        self.total = 0.0
+        self.count = 0
+
+
+# ---------------------------------------------------------------------------
+# Data source: lm-sensors
+# ---------------------------------------------------------------------------
+
+
+JSON_FAILURES_BEFORE_TEXT = 3
+
+
+class SensorSource:
+    """Reads sensors through `sensors`. Prefers JSON, falls back to text."""
+
+    def __init__(self, extra_args: Optional[list[str]] = None):
+        self.extra_args = extra_args or []
+        self.mode = "json"
+        self.last_error: Optional[str] = None
+        self._json_worked = False
+        self._json_failures = 0
+
+    def available(self) -> Optional[str]:
+        """Returns an error message if `sensors` cannot be run."""
+        try:
+            p = subprocess.run(
+                ["sensors", "-v"], capture_output=True, text=True, timeout=5
+            )
+        except FileNotFoundError:
+            return "Command `sensors` not found - install the lm-sensors package."
+        except Exception as exc:  # noqa: BLE001
+            return f"Cannot run `sensors`: {exc}"
+        if p.returncode != 0 and not p.stdout:
+            return "Command `sensors` returned an error: " + (p.stderr or "").strip()
+        return None
+
+    def read(self) -> list[Reading]:
+        if self.mode == "json":
+            out = self._read_json()
+            if out is not None:
+                self._json_worked = True
+                self._json_failures = 0
+                return out
+            # A failure after JSON has worked is transient (a timeout, one bad
+            # sample): use text for this sample only. Text mode is permanent
+            # only for an lm-sensors that has never produced usable JSON.
+            self._json_failures += 1
+            if not self._json_worked and self._json_failures >= JSON_FAILURES_BEFORE_TEXT:
+                self.mode = "text"
+        return self._read_text()
+
+    # -- JSON ---------------------------------------------------------------
+
+    def _run(self, args: list[str]) -> Optional[str]:
+        try:
+            p = subprocess.run(
+                ["sensors", *args, *self.extra_args],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.last_error = str(exc)
+            return None
+        if not p.stdout.strip():
+            self.last_error = (p.stderr or "no data").strip()
+            return None
+        return p.stdout
+
+    def _read_json(self) -> Optional[list[Reading]]:
+        raw = self._run(["-j"])
+        if raw is None:
+            return None
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            # Some drivers can emit invalid JSON (e.g. "nan" or "-nan").
+            try:
+                data = json.loads(re.sub(r"-?\bnan\b", "null", raw, flags=re.I))
+            except json.JSONDecodeError:
+                return None
+        return self._from_json(data)
+
+    @staticmethod
+    def _from_json(data: dict) -> list[Reading]:
+        out: list[Reading] = []
+        for chip, feats in data.items():
+            if not isinstance(feats, dict):
+                continue
+            adapter = str(feats.get("Adapter", ""))
+            for label, sub in feats.items():
+                if label == "Adapter" or not isinstance(sub, dict):
+                    continue
+                # amdgpu/power sometimes reports only *_average instead of *_input
+                inp = next(
+                    (k for k in sub if k.endswith("_input") and _isnum(sub[k])), None
+                ) or next(
+                    (k for k in sub if k.endswith("_average") and _isnum(sub[k])), None
+                )
+                if inp is None:
+                    # the input exists but cannot be read (null/nan/I-O error)
+                    broken = next((k for k in sub if k.endswith("_input")), None)
+                    if broken:
+                        kind_b = kind_from(broken)
+                        out.append(
+                            Reading(
+                                chip=chip,
+                                adapter=adapter,
+                                label=label,
+                                kind=kind_b,
+                                value=float("nan"),
+                                unit=KIND_UNITS.get(kind_b, ""),
+                                error="no value in *_input",
+                            )
+                        )
+                    continue
+                prefix = inp.rsplit("_", 1)[0]
+                kind = kind_from(prefix)
+
+                def pick(*suffixes: str, _sub=sub, _pfx=prefix) -> Optional[float]:
+                    for s in suffixes:
+                        v = _sub.get(f"{_pfx}_{s}")
+                        if _isnum(v):
+                            return float(v)
+                    return None
+
+                out.append(
+                    Reading(
+                        chip=chip,
+                        adapter=adapter,
+                        label=label,
+                        kind=kind,
+                        value=float(sub[inp]),
+                        high=sane_limit(kind, pick("max", "high", "cap")),
+                        crit=sane_limit(kind, pick("crit", "emergency")),
+                        low=sane_limit(kind, pick("min", "lcrit")),
+                        unit=KIND_UNITS.get(kind, ""),
+                    )
+                )
+        return out
+
+    # -- text ---------------------------------------------------------------
+
+    _RE_VALUE = re.compile(
+        r"^(?P<label>[^:]{1,40}):\s+"
+        r"(?P<val>[+-]?\d+(?:\.\d+)?)\s*"
+        r"(?P<unit>°C|C|RPM|%|(?P<prefix>[numkMG]?)(?P<scaled>Hz|V|W|A|J))"
+        r"(?P<rest>.*)$"
+    )
+    # each limit carries its own prefix: 912.00 mV (max = 1.20 V)
+    _RE_LIMIT = re.compile(
+        r"(?P<name>high|crit|max|min)\s*=\s*(?P<val>[+-]?\d+(?:\.\d+)?)\s*"
+        r"(?:(?P<prefix>[numkMG]?)(?:Hz|V|W|A|J)\b)?"
+    )
+    _SI_PREFIX = {"n": 1e-9, "u": 1e-6, "m": 1e-3, "k": 1e3, "M": 1e6, "G": 1e9}
+    # "temp1:  +40 C" has a colon ending the label; "r8169_0_a00:00-mdio-0" does not
+    _RE_LABEL_END = re.compile(r":(?:\s|$)")
+    # ERROR: Can't get value of subfeature temp3_input: I/O error
+    _RE_ERROR = re.compile(
+        r"^ERROR:\s*Can't get value of subfeature\s+(?P<sub>\w+):\s*(?P<why>.+)$"
+    )
+
+    def _read_text(self) -> list[Reading]:
+        raw = self._run([])  # without -A, so the "Adapter:" lines are captured too
+        if raw is None:
+            return []
+        out: list[Reading] = []
+        chip = "?"
+        adapter = ""
+        mult = 1.0  # the scale of the last value, for limits printed without a unit
+        for line in raw.splitlines():
+            if not line.strip():
+                continue
+            if not line[0].isspace() and not self._RE_LABEL_END.search(line):
+                chip, adapter = line.strip(), ""
+                continue
+            if line.startswith("Adapter:"):
+                adapter = line.split(":", 1)[1].strip()
+                continue
+            err = self._RE_ERROR.match(line.strip())
+            if err:
+                sub = err.group("sub")
+                kind_e = kind_from(sub)
+                out.append(
+                    Reading(
+                        chip=chip,
+                        adapter=adapter,
+                        label=sub.rsplit("_", 1)[0],
+                        kind=kind_e,
+                        value=float("nan"),
+                        unit=KIND_UNITS.get(kind_e, ""),
+                        error=err.group("why").strip(),
+                    )
+                )
+                continue
+            if line[0].isspace() and line.lstrip().startswith("(") and out and out[-1].chip == chip:
+                self._apply_limits(out[-1], line, mult)  # limits wrapped to their own line
+                continue
+            m = self._RE_VALUE.match(line.strip())
+            if not m:
+                continue
+            unit = m.group("scaled") or m.group("unit")
+            unit = "°C" if unit in ("C", "°C") else unit
+            kind = {
+                "°C": "temp",
+                "RPM": "fan",
+                "Hz": "freq",
+                "V": "in",
+                "W": "power",
+                "A": "curr",
+                "J": "energy",
+                "%": "humidity",
+            }.get(unit, "temp")
+            # the text `sensors` prints scaled values - the model keeps base units
+            mult = self._SI_PREFIX.get(m.group("prefix") or "", 1.0)
+            reading = Reading(
+                chip=chip,
+                adapter=adapter,
+                label=m.group("label").strip(),
+                kind=kind,
+                value=float(m.group("val")) * mult,
+                unit=KIND_UNITS.get(kind, unit),
+            )
+            self._apply_limits(reading, m.group("rest"), mult)
+            out.append(reading)
+        return out
+
+    def _apply_limits(self, r: Reading, text: str, mult: float) -> None:
+        """Fills the limits still missing from a `(high = ..., crit = ...)` fragment."""
+        limits = {}
+        for m in self._RE_LIMIT.finditer(text):
+            prefix = m.group("prefix")
+            scale = mult if prefix is None else self._SI_PREFIX.get(prefix, 1.0)
+            limits[m.group("name")] = float(m.group("val")) * scale
+        if r.high is None:
+            r.high = sane_limit(r.kind, limits.get("high", limits.get("max")))
+        if r.crit is None:
+            r.crit = sane_limit(r.kind, limits.get("crit"))
+        if r.low is None:
+            r.low = sane_limit(r.kind, limits.get("min"))
+
+
+class DemoSource:
+    """Synthetic data - lets you look at the UI without lm-sensors."""
+
+    # (chip, adapter, label, kind, base_value, high, crit, static?)
+    # The set mirrors a typical AM5 desktop: two amdgpu chips (dGPU + iGPU),
+    # two spd5118 sticks, the NIC PHY and the junk sensors from nct67xx.
+    SPEC = [
+        ("k10temp-pci-00c3", "PCI adapter", "Tctl", "temp", 62, None, 115, False),
+        ("k10temp-pci-00c3", "PCI adapter", "Tccd1", "temp", 58, None, None, False),
+        ("k10temp-pci-00c3", "PCI adapter", "Tccd2", "temp", 56, None, None, False),
+        ("amdgpu-pci-0300", "PCI adapter", "edge", "temp", 52, None, 100, False),
+        ("amdgpu-pci-0300", "PCI adapter", "junction", "temp", 68, None, 110, False),
+        ("amdgpu-pci-0300", "PCI adapter", "mem", "temp", 64, None, 105, False),
+        ("amdgpu-pci-0300", "PCI adapter", "fan1", "fan", 1450, 3300, None, False),
+        ("amdgpu-pci-0300", "PCI adapter", "PPT", "power", 130, 304, None, False),
+        ("amdgpu-pci-0300", "PCI adapter", "vddgfx", "in", 0.912, None, None, False),
+        ("amdgpu-pci-0300", "PCI adapter", "sclk", "freq", 1.436e9, 2.9e9, None, False),
+        ("amdgpu-pci-0300", "PCI adapter", "mclk", "freq", 4.56e8, 1.2e9, None, False),
+        ("amdgpu-pci-0e00", "PCI adapter", "edge", "temp", 44, None, 100, False),
+        ("amdgpu-pci-0e00", "PCI adapter", "vddnb", "in", 1.240, None, None, False),
+        ("amdgpu-pci-0e00", "PCI adapter", "sclk", "freq", 6.0e8, 2.2e9, None, False),
+        ("nvme-pci-0400", "PCI adapter", "Composite", "temp", 41, 84, 87, False),
+        ("nvme-pci-0400", "PCI adapter", "Sensor 2", "temp", 55, None, None, False),
+        # two RAM sticks in deep idle: almost the same temperature and the same
+        # label, yet two different sensors - dedupe must not merge them
+        ("spd5118-i2c-0-50", "SMBus adapter", "temp1", "temp", 37.8, 85, 95, True),
+        ("spd5118-i2c-0-52", "SMBus adapter", "temp1", "temp", 38.0, 85, 95, True),
+        ("r8169_0_a00:00-mdio-0", "MDIO adapter", "temp1", "temp", 68.5, None, 120, False),
+        ("nct6799-isa-0290", "ISA adapter", "SYSTIN", "temp", 36, 80, 90, False),
+        ("nct6799-isa-0290", "ISA adapter", "CPUTIN", "temp", 58, 80, 100, False),
+        # free Super I-O inputs: a voltage converted to degrees, sub-ambient
+        ("nct6799-isa-0290", "ISA adapter", "AUXTIN1", "temp", 6.0, None, None, True),
+        ("nct6799-isa-0290", "ISA adapter", "AUXTIN2", "temp", 17.0, None, None, True),
+        ("nct6799-isa-0290", "ISA adapter", "AUXTIN5", "temp", 11.0, None, None, True),
+        ("nct6799-isa-0290", "ISA adapter", "PCH_CHIP_TEMP", "temp", 0.0, None, None, True),
+        ("nct6799-isa-0290", "ISA adapter", "PCH_CPU_TEMP", "temp", 0.0, None, None, True),
+        ("nct6799-isa-0290", "ISA adapter", "AIO_PUMP", "fan", 4485, 4800, None, False),
+        ("nct6799-isa-0290", "ISA adapter", "fan2", "fan", 890, 2200, None, False),
+        ("nct6799-isa-0290", "ISA adapter", "fan3", "fan", 0, None, None, True),
+        ("nct6799-isa-0290", "ISA adapter", "Vcore", "in", 1.09, None, None, False),
+        ("nct6799-isa-0290", "ISA adapter", "PECI Agent 0 Calibration", "temp", 56.0, None, None, False),
+        ("mt7925_phy0-pci-0100", "PCI adapter", "temp1", "temp", 48, None, None, False),
+        # the same measurement as k10temp/Tctl, only read through Super I-O
+        ("nct6799-isa-0290", "ISA adapter", "TSI0_TEMP", "temp", 62, None, None, False),
+        # a sensor the driver cannot read
+        ("nct6799-isa-0290", "ISA adapter", "temp3", "temp", 0, None, None, False),
+    ]
+
+    # labels that copy the reading of another chip (duplicate measurements)
+    MIRRORS = {("nct6799-isa-0290", "TSI0_TEMP"): ("k10temp-pci-00c3", "Tctl")}
+    # labels that always report a read error
+    BROKEN = {("nct6799-isa-0290", "temp3")}
+
+    def __init__(self) -> None:
+        self.state = {i: float(s[4]) for i, s in enumerate(self.SPEC)}
+        self.t = 0.0
+
+    def available(self) -> Optional[str]:
+        return None
+
+    def read(self) -> list[Reading]:
+        self.t += 0.35
+        out = []
+        for i, (chip, ad, label, kind, base, high, crit, static) in enumerate(self.SPEC):
+            if static:
+                v = float(base)
+            else:
+                span = abs(base) * 0.25 or 1.0
+                wave = math.sin(self.t + i) * span * 0.35
+                self.state[i] += random.uniform(-span * 0.08, span * 0.08)
+                self.state[i] = max(base * 0.75, min(base * 1.35, self.state[i]))
+                v = self.state[i] + wave
+            broken = (chip, label) in self.BROKEN
+            out.append(
+                Reading(
+                    chip=chip,
+                    adapter=ad,
+                    label=label,
+                    kind=kind,
+                    value=float("nan") if broken else round(v, 3 if kind == "in" else 1),
+                    high=high,
+                    crit=crit,
+                    unit=KIND_UNITS.get(kind, ""),
+                    error="I/O error" if broken else None,
+                )
+            )
+        by_key = {(r.chip, r.label): r for r in out}
+        for dst, src in self.MIRRORS.items():
+            if dst in by_key and src in by_key:
+                by_key[dst].value = by_key[src].value
+        return out
+
+
+def sane_limit(kind: str, v: Optional[float]) -> Optional[float]:
+    """Rejects nonsense limits (e.g. NVMe reports temp2_max = 65261 °C)."""
+    if v is None:
+        return None
+    if kind == "temp" and not (-50.0 <= v <= 250.0):
+        return None
+    if kind == "in" and not (-50.0 <= v <= 50.0):
+        return None
+    return v
+
+
+def kind_from(key: str) -> str:
+    """Sensor kind from the hwmon key prefix: temp1_input -> temp."""
+    m = re.match(r"[a-z]+", key)
+    return m.group(0) if m else "temp"
+
+
+def _isnum(v) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and not math.isnan(v)
+
+
+# ---------------------------------------------------------------------------
+# Fixed reference points from /sys - independent of the session length
+# ---------------------------------------------------------------------------
+
+
+class SysfsRefs:
+    """Reads the values from hwmon/DRM that `sensors` does not expose.
+
+    Scaling a bar against the range observed during the session is useless with
+    only a few samples (min == max, every bar full), so the upper reference
+    comes from the hardware: power1_cap, pp_dpm_sclk/mclk, fan*_max.
+    """
+
+    FREQ_FILES = {
+        "sclk": "pp_dpm_sclk",
+        "mclk": "pp_dpm_mclk",
+        "fclk": "pp_dpm_fclk",
+        "socclk": "pp_dpm_socclk",
+    }
+
+    def __init__(self, root: str = "/sys/class/hwmon"):
+        self.root = root
+        self._chips: Optional[dict[str, str]] = None
+        self._by_name: dict[str, list[str]] = {}
+        self._cache: dict[tuple, Optional[float]] = {}
+
+    # -- mapping lm-sensors names onto hwmon directories --------------------
+
+    def chips(self) -> dict[str, str]:
+        if self._chips is None:
+            self._chips, self._by_name = self._scan()
+        return self._chips
+
+    def _scan(self) -> tuple[dict[str, str], dict[str, list[str]]]:
+        chips: dict[str, str] = {}
+        by_name: dict[str, list[str]] = {}
+        try:
+            entries = sorted(os.listdir(self.root))
+        except OSError:
+            return chips, by_name
+        for entry in entries:
+            path = os.path.join(self.root, entry)
+            name = _read_text(os.path.join(path, "name"))
+            if not name:
+                continue
+            by_name.setdefault(name, []).append(path)
+            chip_id = self._chip_id(path, name)
+            if chip_id:
+                chips[chip_id] = path
+        return chips, by_name
+
+    @staticmethod
+    def _chip_id(path: str, name: str) -> Optional[str]:
+        """Rebuilds the lm-sensors style name: amdgpu + 0000:03:00.0 -> amdgpu-pci-0300."""
+        dev = os.path.realpath(os.path.join(path, "device"))
+        parts = dev.split(os.sep)
+        for comp in reversed(parts):
+            m = re.match(r"^[0-9a-f]{4}:([0-9a-f]{2}):([0-9a-f]{2})\.([0-9a-f])$", comp)
+            if m:
+                bus = int(m.group(1), 16)
+                slot, fn = int(m.group(2), 16), int(m.group(3), 16)
+                return f"{name}-pci-{bus:02x}{(slot << 3 | fn):02x}"
+            m = re.match(r"^(\d+)-([0-9a-f]{4})$", comp)
+            if m:
+                return f"{name}-i2c-{int(m.group(1))}-{m.group(2)[-2:]}"
+        return None
+
+    def path_for(self, chip: str) -> Optional[str]:
+        chips = self.chips()
+        if chip in chips:
+            return chips[chip]
+        # ISA/platform (nct6799-isa-0290) has no address to rebuild - it can be
+        # matched by name, but only among the directories that could not be
+        # identified exactly (otherwise amdgpu-pci-0e00 would hit 0300)
+        base = chip.split("-")[0]
+        mapped = set(chips.values())
+        unmapped = [p for p in self._by_name.get(base, []) if p not in mapped]
+        return unmapped[0] if len(unmapped) == 1 else None
+
+    # -- the individual references -----------------------------------------
+
+    def _cached(self, key: tuple, fn) -> Optional[float]:
+        if key not in self._cache:
+            try:
+                self._cache[key] = fn()
+            except (OSError, ValueError):
+                self._cache[key] = None
+        return self._cache[key]
+
+    def fan_max(self, chip: str, label: str) -> Optional[float]:
+        def read() -> Optional[float]:
+            path = self.path_for(chip)
+            if not path:
+                return None
+            # fanN_label lets us match the label to the input number
+            for f in sorted(os.listdir(path)):
+                m = re.match(r"^(fan\d+)_max$", f)
+                if not m:
+                    continue
+                lab = _read_text(os.path.join(path, f"{m.group(1)}_label"))
+                if lab == label or m.group(1) == label:
+                    v = _read_float(os.path.join(path, f))
+                    return v if v and v > 0 else None
+            return None
+
+        return self._cached(("fan", chip, label), read)
+
+    def power_cap(self, chip: str) -> Optional[float]:
+        def read() -> Optional[float]:
+            path = self.path_for(chip)
+            if not path:
+                return None
+            for f in ("power1_cap", "power1_cap_max", "power1_max"):
+                v = _read_float(os.path.join(path, f))
+                if v and v > 0:
+                    return v / 1e6  # microwatts -> watts
+            return None
+
+        return self._cached(("power", chip), read)
+
+    def freq_top(self, chip: str, label: str) -> Optional[float]:
+        """The top entry of pp_dpm_sclk / pp_dpm_mclk (e.g. '2: 2100Mhz *')."""
+
+        def read() -> Optional[float]:
+            fname = self.FREQ_FILES.get(label.lower())
+            path = self.path_for(chip)
+            if not fname or not path:
+                return None
+            dev = os.path.realpath(os.path.join(path, "device"))
+            raw = _read_text(os.path.join(dev, fname))
+            if not raw:
+                return None
+            best = 0.0
+            for line in raw.splitlines():
+                m = re.search(r"(\d+(?:\.\d+)?)\s*(M|G|k)?hz", line, re.I)
+                if m:
+                    mult = {"m": 1e6, "g": 1e9, "k": 1e3}.get(
+                        (m.group(2) or "M").lower(), 1e6
+                    )
+                    best = max(best, float(m.group(1)) * mult)
+            return best or None
+
+        return self._cached(("freq", chip, label), read)
+
+
+def _read_text(path: str) -> str:
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            return fh.read().strip()
+    except OSError:
+        return ""
+
+
+def _read_float(path: str) -> Optional[float]:
+    raw = _read_text(path)
+    try:
+        return float(raw)
+    except ValueError:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Chip aliases - readable names instead of r8169_0_a00:00-mdio-0
+# ---------------------------------------------------------------------------
+
+# fnmatch patterns matched against the chip name; the most specific (longest)
+# pattern wins, and entries from the config file beat the built-in ones.
+DEFAULT_ALIASES = [
+    ("k10temp-*", "CPU"),
+    ("zenpower-*", "CPU"),
+    ("coretemp-*", "CPU"),
+    ("amdgpu-*", "GPU"),
+    ("nouveau-*", "GPU"),
+    ("radeon-*", "GPU"),
+    ("i915-*", "iGPU"),
+    ("nvme-*", "NVMe"),
+    ("drivetemp-*", "disk"),
+    ("spd5118-*", "RAM"),
+    ("jc42-*", "RAM"),
+    ("nct6*", "board"),
+    ("it87*", "board"),
+    ("it86*", "board"),
+    ("asus*", "board"),
+    ("r8169*", "NIC PHY"),
+    ("igb-*", "NIC"),
+    ("iwlwifi*", "WiFi"),
+    ("mt79*", "WiFi PHY"),
+    ("mt76*", "WiFi PHY"),
+    ("ath1*", "WiFi"),
+    ("acpitz-*", "ACPI"),
+    ("BAT*", "battery"),
+    ("ucsi_source_psy*", "USB-C"),
+]
+
+# ---------------------------------------------------------------------------
+# Sensor role ranking - what the measurement is, not how high its bar stands
+# ---------------------------------------------------------------------------
+
+# The default hierarchy: (pattern "chip/label", class). Lower class = more important.
+# The key is the (chip, label) pair, because only the chip says what the reading
+# means: every RAM stick and every PHY carries a `temp1`. The lm-sensors `Adapter`
+# field is no help here - both amdgpu and nvme report "PCI adapter".
+#
+# Neither the value nor the bar fill can be the primary criterion: hwmon limits are
+# not comparable across chips. spd5118 reports high ~55 °C, so a RAM stick at 46 °C
+# fills its bar more than GPU memory at 66 °C (limit 105 °C) - and it is the latter
+# that is worth watching. The reading only decides within a class.
+DEFAULT_PRIORITIES = [
+    ("amdgpu-*/junction", 1),
+    ("amdgpu-*/mem", 1),
+    ("k10temp-*/Tctl", 2),
+    ("amdgpu-*/edge", 3),
+    ("nvme-*/Composite", 4),
+    ("nct6*/SYSTIN", 5),
+    ("nct6*/CPUTIN", 5),
+]
+# A sensor the map does not cover: the "rest" class (PHY, DIMM, AUXTIN, fans, voltages)
+PRIORITY_FALLBACK = 6
+
+CONFIG_DIR = os.path.join(
+    os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"),
+    "sensortop",
+)
+CONFIG_PATH = os.path.join(CONFIG_DIR, "config.toml")
+# the previous format - still read, so an old configuration is not lost
+LEGACY_ALIASES = os.path.join(CONFIG_DIR, "aliases.conf")
+
+
+def load_aliases(path: str = LEGACY_ALIASES) -> list[tuple[str, str]]:
+    """Loads `pattern = alias` from the old aliases.conf file (# is a comment)."""
+    rules: list[tuple[str, str]] = []
+    try:
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.split("#", 1)[0].strip()
+                if not line or "=" not in line:
+                    continue
+                pat, alias = line.split("=", 1)
+                pat, alias = pat.strip(), alias.strip()
+                if pat and alias:
+                    rules.append((pat, alias))
+    except OSError:
+        pass
+    return rules
+
+
+# ---------------------------------------------------------------------------
+# Persistent configuration - ~/.config/sensortop/config.toml
+# ---------------------------------------------------------------------------
+
+# UI settings that survive a restart. Key -> (type, default value).
+UI_SETTINGS = {
+    "sort": (str, "chip"),
+    "interval": (float, 2.0),
+    "fahrenheit": (bool, False),
+    "temps_only": (bool, False),
+    "hide_duplicates": (bool, False),
+    "show_dead": (bool, False),
+    "hide_stale": (bool, False),
+    "mono": (bool, False),
+    "ascii": (bool, False),
+    "window": (int, 0),  # index into WINDOWS: 0 = sample, 1 = 30 s, 2 = 5 min
+    "dual": (bool, False),  # right panel: sensor history or the chip panel
+    "selected": (str, ""),  # the selected sensor as "chip/label"
+}
+TEMP_SETTINGS = {
+    "range": (str, "auto:130"),
+    "floor_margin": (float, TEMP_FLOOR_MARGIN),
+    "dead_after": (int, 20),
+}
+
+
+@dataclass
+class Config:
+    """The contents of config.toml: aliases, the hidden list and the UI settings."""
+
+    path: str = CONFIG_PATH
+    ui: dict = field(default_factory=dict)
+    temps: dict = field(default_factory=dict)
+    aliases: list = field(default_factory=list)  # [(pattern, alias)]
+    hidden: list = field(default_factory=list)  # "chip/label" patterns
+    priorities: list = field(default_factory=list)  # [(pattern, class)]
+    error: Optional[str] = None
+    exists: bool = False
+    alias_notes: dict = field(default_factory=dict)  # chip -> comment with the kinds
+
+    @classmethod
+    def load(cls, path: str = CONFIG_PATH) -> "Config":
+        cfg = cls(path=path)
+        # a --config pointing at an old .conf file still means aliases only
+        if path.endswith(".conf"):
+            cfg.aliases = load_aliases(path)
+            cfg.exists = os.path.exists(path)
+            return cfg
+        raw, cfg.error = _read_toml(path)
+        cfg.exists = raw is not None
+        raw = raw or {}
+        cfg.ui = _typed(raw.get("ui"), UI_SETTINGS)
+        if cfg.ui.get("sort") not in SORTS:  # argparse `choices` does not cover the file
+            cfg.ui.pop("sort", None)
+        cfg.temps = _typed(raw.get("temps"), TEMP_SETTINGS)
+        aliases = raw.get("aliases")
+        if isinstance(aliases, dict):
+            cfg.aliases = [(str(k), str(v)) for k, v in aliases.items() if k and v]
+        hidden_table = raw.get("hidden")
+        hidden = hidden_table.get("sensors") if isinstance(hidden_table, dict) else None
+        if isinstance(hidden, list):
+            cfg.hidden = [str(x) for x in hidden if x]
+        prio = raw.get("priorities")
+        if isinstance(prio, dict):
+            # the class has to be an integer - a typo should be skipped rather
+            # than upend the ordering of the sensor list
+            cfg.priorities = [
+                (str(k), int(v))
+                for k, v in prio.items()
+                if k and isinstance(v, int) and not isinstance(v, bool)
+            ]
+        if not cfg.aliases:  # migration from an aliases.conf sitting next to it
+            cfg.aliases = load_aliases(os.path.join(os.path.dirname(path) or ".", "aliases.conf"))
+        return cfg
+
+    def save(self) -> None:
+        """Writes the whole file. User comments do not survive a save."""
+        if self.path.endswith(".conf"):
+            # load() reads .conf as `pattern = alias` lines, so TOML here would
+            # destroy the aliases and the settings would not come back
+            raise OSError("a .conf file holds aliases only - use --config with a .toml path")
+        os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
+        tmp = self.path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(self.dumps())
+        os.replace(tmp, self.path)  # atomic write - never half a file
+        self.exists = True
+
+    def dumps(self) -> str:
+        out = [
+            "# sensortop - configuration",
+            f"# Saved {time.strftime('%Y-%m-%d %H:%M:%S')} (the `W` key in the TUI).",
+            "",
+            "[ui]",
+        ]
+        for key, (_typ, default) in UI_SETTINGS.items():
+            if key == "ascii":
+                out.append("# ascii = true forces ASCII charts instead of braille")
+            elif key == "window":
+                out.append("# window: the history window - 0 = sample, 1 = 30 s, 2 = 5 min")
+            elif key == "dual":
+                out.append("# dual = true opens the right panel as the chip panel (the `u` key)")
+            elif key == "selected":
+                out.append('# selected: the selected sensor as "chip/label". When it is missing')
+                out.append("# from the current set, the choice falls back to the [priorities] ranking.")
+            out.append(f"{key} = {_toml_val(self.ui.get(key, default))}")
+        out += [
+            "",
+            "[temps]",
+            "# range: MIN:MAX in °C. MIN = auto -> the floor is computed from the",
+            "# trustworthy sensors (the coldest of them minus floor_margin),",
+            "# instead of a fixed value.",
+        ]
+        for key, (_typ, default) in TEMP_SETTINGS.items():
+            out.append(f"{key} = {_toml_val(self.temps.get(key, default))}")
+        out += [
+            "",
+            "[aliases]",
+            "# \"fnmatch pattern\" = \"alias\"  (the longest pattern wins)",
+        ]
+        for pat, alias in self.aliases:
+            note = self.alias_notes.get(pat)
+            if note:
+                out.append(f"# {pat}: {note}")
+            out.append(f"{_toml_val(pat)} = {_toml_val(alias)}")
+        out += [
+            "",
+            "[priorities]",
+            "# Sensor role ranking: decides what is selected at startup and which",
+            "# series reach the chip panel (`u`). A lower number = more important,",
+            f"# a sensor outside the map gets class {PRIORITY_FALLBACK}. The value and the limit",
+            "# only decide within a class - hwmon limits are not comparable across chips.",
+            '# Key: "chip pattern/label" (fnmatch, as in [hidden]).',
+        ]
+        out += [f"{_toml_val(pat)} = {cls:d}" for pat, cls in self.priorities]
+        out += [
+            "",
+            "[hidden]",
+            "# Sensors hidden manually (the `x` key), as \"chip/label\";",
+            "# fnmatch patterns work, e.g. \"nct6799-*/AUXTIN*\".",
+            "sensors = [",
+        ]
+        out += [f"  {_toml_val(p)}," for p in self.hidden]
+        out += ["]", ""]
+        return "\n".join(out)
+
+
+def _read_toml(path: str) -> tuple[Optional[dict], Optional[str]]:
+    """Returns (data, error). A missing file is not an error - just no data."""
+    try:
+        import tomllib
+    except ImportError:  # Python < 3.11
+        if not os.path.exists(path):
+            return None, None
+        return None, f"{path}: requires Python 3.11+ (tomllib) - configuration skipped"
+    try:
+        with open(path, "rb") as fh:
+            return tomllib.load(fh), None
+    except FileNotFoundError:
+        return None, None
+    except OSError as exc:
+        return None, f"{path}: {exc.strerror}"
+    except Exception as exc:  # noqa: BLE001 - tomllib.TOMLDecodeError
+        return None, f"{path}: {exc}"
+
+
+def _typed(section, spec: dict) -> dict:
+    """Lets through only known keys of a matching type - a typo cannot crash the TUI."""
+    if not isinstance(section, dict):
+        return {}
+    out = {}
+    for key, value in section.items():
+        if key not in spec:
+            continue
+        typ = spec[key][0]
+        if typ is bool and isinstance(value, bool):
+            out[key] = value
+        elif typ is float and isinstance(value, (int, float)) and not isinstance(value, bool):
+            out[key] = float(value)
+        elif typ is int and isinstance(value, int) and not isinstance(value, bool):
+            out[key] = value
+        elif typ is str and isinstance(value, str):
+            out[key] = value
+    return out
+
+
+def _toml_val(v) -> str:
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, (int, float)):
+        return repr(v)
+    if isinstance(v, (list, tuple)):
+        return "[" + ", ".join(_toml_val(x) for x in v) + "]"
+    return '"' + str(v).replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+class ChipNamer:
+    """Gives chips readable names and resolves collisions (two amdgpu, two spd5118)."""
+
+    def __init__(self, user_rules: Optional[list[tuple[str, str]]] = None):
+        # the user rules first, then the built-in ones; within each group the
+        # longer (more specific) pattern takes precedence
+        user = sorted(user_rules or [], key=lambda kv: -len(kv[0]))
+        builtin = sorted(DEFAULT_ALIASES, key=lambda kv: -len(kv[0]))
+        self.rules = user + builtin
+        self._cache: dict[str, str] = {}
+
+    def base_alias(self, chip: str) -> Optional[str]:
+        for pat, alias in self.rules:
+            if fnmatch.fnmatch(chip, pat):
+                return alias
+        return None
+
+    def rebuild(self, chips) -> None:
+        """Computes the aliases for a set of chips, adding a suffix on collision."""
+        chips = list(dict.fromkeys(chips))
+        groups: dict[str, list[str]] = {}
+        for chip in chips:
+            groups.setdefault(self.base_alias(chip) or short_chip(chip), []).append(chip)
+        cache: dict[str, str] = {}
+        for name, members in groups.items():
+            if len(members) == 1:
+                cache[members[0]] = name
+                continue
+            for chip, suffix in zip(members, distinct_suffixes(members)):
+                cache[chip] = f"{name}/{suffix}"
+        self._cache = cache
+
+    def alias(self, chip: str) -> str:
+        if chip not in self._cache:
+            self.rebuild(list(self._cache) + [chip])
+        return self._cache.get(chip, short_chip(chip))
+
+    def qualified(self, r: Reading) -> str:
+        """The sensor name with its chip context, e.g. 'GPU/mem'."""
+        return f"{self.alias(r.chip)}/{r.label}"
+
+
+def chip_suffix(chip: str) -> str:
+    """The fragment distinguishing chips of the same type (e.g. pci-0300 -> 0300)."""
+    m = re.search(r"(?:pci|i2c|isa|acpi|mdio)[-_]([0-9a-f:.-]+)$", chip, re.I)
+    if m:
+        return m.group(1).split("-")[-1]
+    return chip.rsplit("-", 1)[-1]
+
+
+def distinct_suffixes(chips: list[str]) -> list[str]:
+    """Suffixes telling apart chips that share a name, unique within the list."""
+    short = [chip_suffix(c) for c in chips]
+    if len(set(short)) == len(chips):
+        return short
+    # the short form collides (spd5118-i2c-0-50 / -1-50): keep the fields that differ
+    fields = [c.split("-") for c in chips]
+    if len({len(f) for f in fields}) > 1:
+        return list(chips)
+    keep = [i for i, col in enumerate(zip(*fields)) if len(set(col)) > 1]
+    return ["-".join(f[i] for i in keep) for f in fields]
+
+
+def short_chip(chip: str) -> str:
+    """Shortens a chip name that has no alias: r8169_0_a00:00-mdio-0 -> r8169_0_a00."""
+    return chip.split(":")[0].split("-")[0][:14] or chip
+
+
+def detected_aliases(namer: ChipNamer, chips) -> list[tuple[str, str]]:
+    """Base aliases of the detected chips - a starting point for the config file.
+
+    Base, i.e. without the collision-breaking suffix: after one line is edited
+    (GPU -> iGPU) the other no longer needs a suffix and returns to a clean name.
+    """
+    return [(chip, namer.base_alias(chip) or short_chip(chip)) for chip in dict.fromkeys(chips)]
+
+
+def sensor_id(r: Reading) -> str:
+    """The sensor identity in the config: "chip/label" (like the [hidden] patterns)."""
+    return f"{r.chip}/{r.label}"
+
+
+class PriorityMap:
+    """The importance class of a sensor, derived from the (chip, label) pair.
+
+    The patterns work as in [hidden] - fnmatch on "chip/label" - and the most
+    specific (longest) one wins; rules from the config beat the built-in ones.
+    To demote a built-in entry it is enough to give it a higher class; nothing
+    has to be removed.
+    """
+
+    def __init__(self, user_rules=None, builtin=None):
+        base = DEFAULT_PRIORITIES if builtin is None else builtin
+        user = sorted(user_rules or [], key=lambda kv: -len(kv[0]))
+        self.rules = user + sorted(base, key=lambda kv: -len(kv[0]))
+
+    def klass(self, r: Reading) -> int:
+        name = sensor_id(r)
+        for pat, cls in self.rules:
+            if fnmatch.fnmatch(name, pat):
+                return cls
+        return PRIORITY_FALLBACK
+
+
+def rank_key(r: Reading, cls: int, ratio: Optional[float]) -> tuple:
+    """The ranking key: class, kind, bar fill, identity.
+
+    The kind comes before the reading because the "rest" class holds
+    temperatures and fans side by side, and 80% of maximum RPM does not mean
+    the same as 80% of the way to a limit. The chip and label close out ties -
+    it has to resolve the same way on every run, not by the hwmon order.
+    """
+    return (cls, KIND_ORDER.get(r.kind, 9), -(ratio or 0.0), r.chip, r.label)
+
+
+# ---------------------------------------------------------------------------
+# Helpers: scaling, colours, charts
+# ---------------------------------------------------------------------------
+
+
+def clamp(v: float, lo: float, hi: float) -> float:
+    return lo if v < lo else hi if v > hi else v
+
+
+def to_f(c: float) -> float:
+    return c * 9.0 / 5.0 + 32.0
+
+
+def fmt_freq(hz: float) -> str:
+    """Raw hwmon Hz into a readable unit: 1436000000.0 -> 1.44 GHz."""
+    a = abs(hz)
+    if a >= 1e9:
+        return f"{hz / 1e9:5.2f} GHz"
+    if a >= 1e6:
+        return f"{hz / 1e6:5.0f} MHz"
+    if a >= 1e3:
+        return f"{hz / 1e3:5.0f} kHz"
+    return f"{hz:5.0f} Hz"
+
+
+def palette_of(r: Reading) -> str:
+    """Only temperatures get the alarm palette; everything else stays neutral."""
+    return "heat" if r.kind == "temp" else "cool"
+
+
+def reference_top(r: Reading, refs=None) -> Optional[tuple[float, str]]:
+    """The fixed upper reference of a bar: (value, source). None = no basis.
+
+    The session range is deliberately not used: with a few samples min == max,
+    so every bar would come out full (or empty) regardless of the reading.
+    """
+    if r.kind == "fan":
+        if r.high:
+            return r.high, "fan*_max"
+        if refs:
+            v = refs.fan_max(r.chip, r.label)
+            if v:
+                return v, "fan*_max"
+        if any(h in r.label.lower() for h in PUMP_HINTS):
+            return DEFAULT_PUMP_TOP, "pump default"
+        return DEFAULT_FAN_TOP, "case-fan default"
+    if r.kind == "power":
+        if r.high:
+            return r.high, "power1_cap"
+        if refs:
+            v = refs.power_cap(r.chip)
+            if v:
+                return v, "power1_cap"
+        return None
+    if r.kind == "freq":
+        if r.high:
+            return r.high, "freq*_max"
+        if refs:
+            v = refs.freq_top(r.chip, r.label)
+            if v:
+                return v, f"pp_dpm_{r.label.lower()}"
+        return None
+    if r.kind == "in":
+        for step in VOLT_LADDER:
+            if abs(r.value) <= step:
+                return step, f"{step:g} V rail"
+        return abs(r.value), "reading"
+    if r.kind == "curr" and r.high:
+        return r.high, "curr*_max"
+    return None
+
+
+# Bottom of the temperature scale: below 20 °C there is nothing to look at
+TEMP_SCALE_FLOOR = 20.0
+# When the driver reports no limit at all, the bar still needs a reference
+TEMP_SCALE_FALLBACK = 100.0
+
+
+def usable_temp_limit(value: Optional[float]) -> bool:
+    """False for missing limits and for placeholders such as temp1_crit = 0."""
+    return value is not None and value > TEMP_SCALE_FLOOR
+
+
+def temp_top(r: Reading) -> tuple[Optional[float], str]:
+    """The upper temperature reference: (value, limit name) or (None, "").
+
+    `high` takes precedence over `crit`: it is the working limit at which the
+    hardware starts defending itself, not the emergency shutdown boundary. One
+    source for the bar and for the chart - otherwise the same 41 °C would mean
+    something different in each panel.
+    """
+    for value, name in ((r.high, "high limit"), (r.crit, "crit limit")):
+        if usable_temp_limit(value):
+            return value, name
+    return None, ""
+
+
+def scale_range(r: Reading, stats: Stats, refs=None) -> Optional[tuple[float, float]]:
+    """The (bottom, top) range of a bar, or None when there is no sane reference."""
+    if r.kind == "temp":
+        top, _src = temp_top(r)
+        return TEMP_SCALE_FLOOR, max(top or TEMP_SCALE_FALLBACK, 40.0)
+    ref = reference_top(r, refs)
+    if ref is None or ref[0] <= 0:
+        return None
+    return 0.0, ref[0]
+
+
+def graph_range(r: Reading, stats: Stats, refs=None) -> Optional[tuple[float, float, str]]:
+    """The vertical scale of the history panel: (bottom, top, source), or None = autoscale.
+
+    It is the same scale as the bar uses (`scale_range`), so the bar fill and
+    the chart height mean the same thing: 20 °C -> the hwmon limit. The chart
+    is meant to show the distance to the limit, not the shape of the noise -
+    scaled to the observed maximum every sensor looks equally dramatic.
+
+    There is one difference from the bar: a sensor without any limit has
+    nothing to be scaled against, so instead of an invented 100 °C it falls
+    back to autoscaling (the details panel notes that).
+    """
+    if r.kind == "temp":
+        top, src = temp_top(r)
+        if top is None:
+            return None
+        lo, hi = scale_range(r, stats, refs)
+        return lo, hi, src
+    rng = scale_range(r, stats, refs)
+    if rng is None:
+        return None
+    if r.kind == "in" and r.value < 0:
+        return None  # the 0..rail scale would clip a negative rail to an empty chart
+    src = reference_top(r, refs)
+    return rng[0], rng[1], (src[1] if src else "reference")
+
+
+def graph_threshold(r: Reading) -> Optional[tuple[float, str]]:
+    """The limit drawn on the chart as a horizontal line - the same one that sets the scale."""
+    if r.kind != "temp":
+        return None
+    top, src = temp_top(r)
+    return None if top is None else (top, src)
+
+
+def ratio_of(r: Reading, stats: Stats, refs=None) -> Optional[float]:
+    """The bar fill 0..1, or None when the scale is unknown."""
+    if math.isnan(r.value):
+        return None
+    rng = scale_range(r, stats, refs)
+    if rng is None:
+        return None
+    lo, hi = rng
+    value = abs(r.value) if r.kind == "in" else r.value  # -12 V fills a bar like +12 V
+    return clamp((value - lo) / (hi - lo) if hi > lo else 0.0, 0.0, 1.0)
+
+
+def mirrors(
+    ha,
+    hb,
+    tol: float = DUPE_TOLERANCE,
+    min_samples: int = DUPE_MIN_SAMPLES,
+    agreement: float = DUPE_AGREEMENT,
+    window: int = DUPE_WINDOW,
+) -> bool:
+    """Are two series of readings the same measurement?
+
+    The criterion is purely quantitative: the readings differ by less than
+    `tol` in at least an `agreement` fraction of the last N samples. Names,
+    labels and adapters play no part in it.
+
+    With N < `min_samples` the answer is "I do not know", which is not the same
+    as "yes" - absence of data is not proof, so nothing gets flagged.
+    """
+    n = min(len(ha), len(hb), window)
+    if n < min_samples:
+        return False
+    a, b = tail_of(ha, n), tail_of(hb, n)
+    close = sum(1 for x, y in zip(a, b) if abs(x - y) < tol)
+    return close >= agreement * n
+
+
+def trusted_temps(readings) -> list:
+    """The temperature sensors we trust: those for which the driver gave a limit.
+
+    A driver that knows the `high`/`crit` of an input also knows what that
+    input measures. The free Super I-O inputs (AUXTIN*) have no limits, and
+    they are exactly the ones returning a random voltage converted to degrees.
+    """
+    lo, hi = TEMP_PHYSICAL
+    return [
+        r
+        for r in readings
+        if r.kind == "temp"
+        and r.valid
+        and (r.high is not None or r.crit is not None)
+        and lo <= r.value <= hi
+    ]
+
+
+def dynamic_floor(
+    readings,
+    margin: float = TEMP_FLOOR_MARGIN,
+    cap: float = TEMP_FLOOR_CAP,
+    hard: float = TEMP_PHYSICAL[0],
+) -> float:
+    """The floor below which a temperature is physically impossible in this case.
+
+    A fixed 5 °C lets junk through (AUXTIN1 = 6.0 with a 35 °C average) because
+    it knows nothing about the conditions. The reference points are the coldest
+    trustworthy sensors - nothing in a running computer is `margin` degrees
+    colder than those. The result is clamped to [hard, cap], so a hot system
+    cannot drag the floor absurdly high.
+    """
+    ref = trusted_temps(readings)
+    if not ref:
+        return hard
+    return clamp(min(r.value for r in ref) - margin, hard, cap)
+
+
+def dead_reason(
+    r: Reading,
+    stats: Stats,
+    after: int = 20,
+    temp_range: tuple[float, float] = TEMP_PHYSICAL,
+    hide_stale: bool = False,
+) -> Optional[str]:
+    """Is the sensor bogus? Returns the reason, or None.
+
+    The default criteria (each decisive on its own):
+      1. the reading is exactly 0.0 for the whole session,
+      2. the reading is outside the physical range (temperatures: temp_range),
+      3. no *_input in sysfs, or a read error reported by the driver.
+    Stability of the value alone is NOT evidence - a stable sensor is usually a
+    working sensor. The "unchanged for N samples" criterion is optional
+    (hide_stale) and off by default.
+    """
+    if r.error:  # (3)
+        return f"read error: {r.error}"
+    if math.isnan(r.value):
+        return "no value (*_input)"
+
+    low = r.label.lower()
+    if any(fnmatch.fnmatch(low, p) for p in JUNK_LABELS):
+        return "calibration entry, not a measuring point"
+
+    if stats.count == 0:
+        return None
+    if stats.vmin == 0.0 and stats.vmax == 0.0:  # (1)
+        return "constant 0.0 for the whole session"
+    if r.kind == "temp":  # (2)
+        lo, hi = temp_range
+        if stats.vmax < lo or stats.vmin > hi:
+            return f"outside the physical range ({lo:g}-{hi:g} °C)"
+    if hide_stale and stats.count >= after and stats.vmin == stats.vmax:
+        return f"unchanged for {stats.count} samples"
+    return None
+
+
+def alarm_level(r: Reading) -> int:
+    """0 = ok, 1 = the high limit is exceeded, 2 = the critical limit is exceeded."""
+    if r.kind != "temp":
+        return 0
+    crit = r.crit if usable_temp_limit(r.crit) else None
+    high = r.high if usable_temp_limit(r.high) else None
+    if crit is not None and r.value >= crit:
+        return 2
+    if high is not None and r.value >= high:
+        return 1
+    if crit is not None and r.value >= crit * 0.92:
+        return 1
+    return 0
+
+
+# Block characters for the bars (from 1/8 to 8/8)
+BLOCKS = " ▏▎▍▌▋▊▉█"
+# Braille bit mapping: DOT[row_in_cell][column_in_cell]
+DOT = [(0x01, 0x08), (0x02, 0x10), (0x04, 0x20), (0x40, 0x80)]
+
+
+def braille_area(
+    series, width: int, height: int, ymin: float, ymax: float
+) -> list[str]:
+    """An area chart in braille characters - 2x4 dots per cell."""
+    if width <= 0 or height <= 0:
+        return []
+    cells = [[0] * width for _ in range(height)]
+    slots = width * 2
+    data = tail_of(series, slots)
+    offset = slots - len(data)
+    py = height * 4
+    span = ymax - ymin
+    for i, v in enumerate(data):
+        pos = offset + i
+        col, sub = pos // 2, pos % 2
+        t = clamp((v - ymin) / span if span > 0 else 0.5, 0.0, 1.0)
+        top = int(round((1.0 - t) * (py - 1)))
+        for rd in range(top, py):
+            cells[rd // 4][col] |= DOT[rd % 4][sub]
+    return ["".join(chr(0x2800 + c) for c in row) for row in cells]
+
+
+def row_at(value: float, lo: float, hi: float, height: int) -> Optional[int]:
+    """The chart row a given value falls into. None = out of range."""
+    if height <= 0 or hi <= lo or not (lo <= value <= hi):
+        return None
+    return int(round((1.0 - (value - lo) / (hi - lo)) * (height - 1)))
+
+
+# Fallback for terminals/locales without braille: one sample per column.
+ASCII_LEVELS = "_.-~^"
+ASCII_FILL = "#"
+
+
+def ascii_area(series, width: int, height: int, ymin: float, ymax: float) -> list[str]:
+    """An area chart in plain ASCII - character resolution, not dot resolution."""
+    if width <= 0 or height <= 0:
+        return []
+    cells = [[" "] * width for _ in range(height)]
+    data = tail_of(series, width)
+    offset = width - len(data)
+    span = ymax - ymin
+    for i, v in enumerate(data):
+        col = offset + i
+        t = clamp((v - ymin) / span if span > 0 else 0.5, 0.0, 1.0)
+        top = int(round((1.0 - t) * (height - 1)))
+        for row in range(top, height):
+            cells[row][col] = ASCII_FILL
+    return ["".join(row) for row in cells]
+
+
+def ascii_line(series, width: int) -> str:
+    """An ASCII sparkline: the five-level ramp `_.-~^`."""
+    data = tail_of(series, width)
+    if not data:
+        return " " * width
+    lo, hi = min(data), max(data)
+    span = hi - lo
+    out = []
+    for v in data:
+        t = clamp((v - lo) / span if span > 0 else 0.5, 0.0, 1.0)
+        out.append(ASCII_LEVELS[int(round(t * (len(ASCII_LEVELS) - 1)))])
+    return "".join(out).rjust(width)
+
+
+def braille_supported(win=None) -> bool:
+    """Can the locale and the terminal handle U+2800..U+28FF?
+
+    It asks the locale first (curses encodes its output with exactly that),
+    then - if we have a window - actually tries to write U+28FF. A terminal
+    that cannot do it raises an error instead of drawing garbage.
+    """
+    enc = getattr(sys.stdout, "encoding", None) or locale.getpreferredencoding(False)
+    try:
+        "⣿".encode(enc or "ascii")
+    except (UnicodeEncodeError, LookupError, TypeError):
+        return False
+    if win is None:
+        return True
+    try:
+        win.addstr(0, 0, "⣿")
+    except (curses.error, UnicodeError, ValueError):
+        return False
+    finally:
+        try:
+            win.erase()
+        except curses.error:
+            pass
+    return True
+
+
+def braille_line(series, width: int) -> str:
+    """A single-row braille sparkline (4 levels)."""
+    data = tail_of(series, width * 2)
+    if not data:
+        return " " * width
+    lo, hi = min(data), max(data)
+    span = hi - lo
+    cells = [0] * width
+    offset = width * 2 - len(data)
+    for i, v in enumerate(data):
+        pos = offset + i
+        col, sub = pos // 2, pos % 2
+        t = clamp((v - lo) / span if span > 0 else 0.5, 0.0, 1.0)
+        row = 3 - int(round(t * 3))
+        cells[col] |= DOT[row][sub]
+    return "".join(chr(0x2800 + c) for c in cells)
+
+
+# The mean marker in ASCII mode - it has to differ from the band fill (`#`),
+# because ASCII has no subpixels and the mean line has nothing to stand out
+# with beyond the shape of the character itself.
+ASCII_MEAN = "="
+
+
+def _dot(grid, row: int, col: int, sub: int, braille: bool) -> None:
+    """Lights a dot (braille) or a whole cell (ASCII) in the mask grid."""
+    if braille:
+        grid[row // 4][col] |= DOT[row % 4][sub]
+    else:
+        grid[row][col] = 1
+
+
+def cell_grid(
+    cols,
+    width: int,
+    height: int,
+    ymin: float,
+    ymax: float,
+    repeat: int = 1,
+    band: bool = False,
+    braille: bool = True,
+    down: bool = False,
+) -> tuple[list, list]:
+    """Mask grids for one series of buckets: (the min-max band, the mean).
+
+    Masks are returned rather than finished characters, because the dual-axis
+    panel composes several series into one cell and has to know which of them
+    took it - in curses the colour is an attribute of the cell, not of the dot.
+
+    `repeat` is the width of one bucket in slots (braille: 2 slots = a cell),
+    which keeps the 5-minute window from shrinking to three cells at the right
+    edge. `down` flips the axis: the value grows downwards, which is what the
+    fan speeds below the centre axis need.
+    """
+    grid = [[0] * max(width, 0) for _ in range(max(height, 0))]
+    mean = [[0] * max(width, 0) for _ in range(max(height, 0))]
+    if width <= 0 or height <= 0:
+        return grid, mean
+    subs = 2 if braille else 1
+    slots = width * subs
+    per = max(1, int(repeat))
+    data = list(cols)[-max(1, slots // per) :]
+    py = height * 4 if braille else height
+    span = ymax - ymin
+
+    def row_of(v: float) -> int:
+        t = clamp((v - ymin) / span if span > 0 else 0.5, 0.0, 1.0)
+        return int(round((t if down else 1.0 - t) * (py - 1)))
+
+    offset = slots - len(data) * per  # the newest bucket touches the right edge
+    for i, b in enumerate(data):
+        top, bot, avg = row_of(b.hi), row_of(b.lo), row_of(b.avg)
+        if top > bot:
+            top, bot = bot, top  # with `down` the extremes swap places
+        for s in range(per):
+            pos = offset + i * per + s
+            if not 0 <= pos < slots:
+                continue  # bucket wider than the panel - draw as much as fits
+            col, sub = divmod(pos, subs)
+            if band:
+                for rd in range(top, bot + 1):
+                    _dot(grid, rd, col, sub, braille)
+            _dot(grid, avg, col, sub, braille)
+            _dot(mean, avg, col, sub, braille)
+    return grid, mean
+
+
+def render_cells(grid, mean, braille: bool = True) -> tuple[list[str], list[list[int]]]:
+    """Masks -> (the rows to draw, the columns carrying the mean).
+
+    The rows already hold the band and the mean composed into one character;
+    the column list only says which cells should be overpainted with the mean
+    colour, so the line stays visible inside the band.
+    """
+    rows: list[str] = []
+    marks: list[list[int]] = []
+    for y, line in enumerate(grid):
+        if braille:
+            rows.append("".join(chr(0x2800 + c) for c in line))
+        else:
+            rows.append(
+                "".join(
+                    ASCII_MEAN if mean[y][x] else (ASCII_FILL if c else " ")
+                    for x, c in enumerate(line)
+                )
+            )
+        marks.append([x for x, m in enumerate(mean[y]) if m])
+    return rows, marks
+
+
+def band_area(
+    cols, width: int, height: int, ymin: float, ymax: float, repeat: int = 1,
+    braille: bool = True, band: bool = True, down: bool = False,
+) -> tuple[list[str], list[list[int]]]:
+    """The min-max band as a fill + the mean line, ready to be drawn."""
+    grid, mean = cell_grid(
+        cols, width, height, ymin, ymax, repeat, band=band, braille=braille, down=down
+    )
+    return render_cells(grid, mean, braille)
+
+
+def merge_layers(layers, width: int, height: int) -> tuple[list, list]:
+    """Composes the series of the dual-axis panel: (masks, cell owner).
+
+    The dots add up (intersections stay visible), but the cell colour belongs
+    to the series that came last - the layer order is the drawing order.
+    """
+    grid = [[0] * width for _ in range(height)]
+    owner = [[-1] * width for _ in range(height)]
+    for idx, layer in layers:
+        for y in range(height):
+            row = layer[y]
+            for x in range(width):
+                if row[x]:
+                    grid[y][x] |= row[x]
+                    owner[y][x] = idx
+    return grid, owner
+
+
+# ---------------------------------------------------------------------------
+# Colours
+# ---------------------------------------------------------------------------
+
+# Colour pairs: P_GRAD.. is the "heat" gradient (green -> yellow -> red),
+# P_COOL.. is the neutral palette (navy -> light blue) for quantities that have
+# nothing to do with an alarm: fan speeds, frequencies, voltages, power.
+GRAD_N = 11
+P_GRAD = 1
+P_COOL = 40
+P_TITLE = 20
+P_FRAME = 21
+P_DIM = 22
+P_TEXT = 23
+P_SEL = 24
+P_WARN = 25
+P_CRIT = 26
+P_HDR = 27
+P_ACCENT = 28
+P_VALUE = 29  # the fixed text colour of non-temperature values
+
+
+def init_colors(mono: bool) -> bool:
+    """Initialises the colour pairs. Returns True if colours are available."""
+    if mono or not curses.has_colors():
+        return False
+    curses.start_color()
+    try:
+        curses.use_default_colors()
+        bg = -1
+    except curses.error:
+        bg = curses.COLOR_BLACK
+
+    if curses.COLORS >= 256:
+        # a path through the 6x6x6 cube: green (0,5,0) -> yellow (5,5,0) -> red (5,0,0)
+        grad = [16 + 36 * r + 6 * 5 for r in range(6)] + [
+            16 + 36 * 5 + 6 * g for g in (4, 3, 2, 1, 0)
+        ]
+        # blue -> light blue -> bright cyan; no dark shades, which are all but
+        # invisible on a black background
+        cool = [26, 32, 32, 38, 39, 44, 45, 45, 51, 87, 123]
+        ui = {
+            P_TITLE: 51,
+            P_FRAME: 240,
+            P_DIM: 244,
+            P_TEXT: 252,
+            P_SEL: 45,
+            P_WARN: 214,
+            P_CRIT: 196,
+            P_HDR: 117,
+            P_ACCENT: 111,
+            P_VALUE: 159,
+        }
+    else:
+        grad = [
+            curses.COLOR_GREEN,
+            curses.COLOR_GREEN,
+            curses.COLOR_GREEN,
+            curses.COLOR_CYAN,
+            curses.COLOR_CYAN,
+            curses.COLOR_YELLOW,
+            curses.COLOR_YELLOW,
+            curses.COLOR_YELLOW,
+            curses.COLOR_MAGENTA,
+            curses.COLOR_RED,
+            curses.COLOR_RED,
+        ]
+        cool = [curses.COLOR_BLUE] * 6 + [curses.COLOR_CYAN] * 5
+        ui = {
+            P_TITLE: curses.COLOR_CYAN,
+            P_FRAME: curses.COLOR_BLUE,
+            P_DIM: curses.COLOR_WHITE,
+            P_TEXT: curses.COLOR_WHITE,
+            P_SEL: curses.COLOR_CYAN,
+            P_WARN: curses.COLOR_YELLOW,
+            P_CRIT: curses.COLOR_RED,
+            P_HDR: curses.COLOR_CYAN,
+            P_ACCENT: curses.COLOR_BLUE,
+            P_VALUE: curses.COLOR_CYAN,
+        }
+
+    for i, c in enumerate(grad[:GRAD_N]):
+        curses.init_pair(P_GRAD + i, c, bg)
+    for i, c in enumerate(cool[:GRAD_N]):
+        curses.init_pair(P_COOL + i, c, bg)
+    for pair, c in ui.items():
+        curses.init_pair(pair, c, bg)
+    return True
+
+
+class Theme:
+    """Access to the colour attributes (with a graceful fallback to mono mode)."""
+
+    def __init__(self, colored: bool):
+        self.colored = colored
+
+    def grad(self, t: float, palette: str = "heat") -> int:
+        """A colour from a palette: 'heat' for temperatures, 'cool' for everything else."""
+        if not self.colored:
+            return curses.A_NORMAL
+        idx = int(clamp(t, 0, 1) * (GRAD_N - 1) + 0.5)
+        base = P_GRAD if palette == "heat" else P_COOL
+        return curses.color_pair(base + idx)
+
+    def c(self, pair: int) -> int:
+        return curses.color_pair(pair) if self.colored else curses.A_NORMAL
+
+
+# ---------------------------------------------------------------------------
+# Drawing
+# ---------------------------------------------------------------------------
+
+
+def ellipsis(s: str, width: int) -> str:
+    """Trims text to the given width, appending an ellipsis character."""
+    if width <= 0:
+        return ""
+    return s if len(s) <= width else s[: width - 1] + "…"
+
+
+def safe_addstr(win, y: int, x: int, s: str, attr: int = 0) -> None:
+    """An addstr that does not blow up at the edges of the screen."""
+    if y < 0 or x < 0:
+        return
+    h, w = win.getmaxyx()
+    if y >= h or x >= w:
+        return
+    s = s[: w - x]
+    try:
+        win.addstr(y, x, s, attr)
+    except curses.error:
+        pass  # the last cell of the screen - curses always protests
+    except UnicodeError:
+        # the locale cannot handle this character: a gap beats an exception in the draw loop
+        try:
+            win.addstr(y, x, s.encode("ascii", "replace").decode("ascii"), attr)
+        except curses.error:
+            pass
+
+
+def draw_box(win, y, x, h, w, title, theme, title_attr=None) -> None:
+    if h < 2 or w < 2:
+        return
+    fr = theme.c(P_FRAME)
+    safe_addstr(win, y, x, "╭" + "─" * (w - 2) + "╮", fr)
+    for i in range(1, h - 1):
+        safe_addstr(win, y + i, x, "│", fr)
+        safe_addstr(win, y + i, x + w - 1, "│", fr)
+    safe_addstr(win, y + h - 1, x, "╰" + "─" * (w - 2) + "╯", fr)
+    if title and w > 8:
+        t = ellipsis(f" {title} ", w - 4)
+        safe_addstr(win, y, x + 2, t, title_attr or theme.c(P_TITLE) | curses.A_BOLD)
+
+
+def draw_bar(win, y, x, width, ratio, theme, empty_char="·", palette="heat") -> None:
+    """A bar with a horizontal gradient (as in btop) + partial block characters."""
+    if width <= 0:
+        return
+    filled = clamp(ratio, 0, 1) * width
+    full = int(filled)
+    frac = filled - full
+    for i in range(width):
+        t = i / max(width - 1, 1)
+        if i < full:
+            ch, attr = "█", theme.grad(t, palette)
+        elif i == full and frac > 0.12:
+            # min. 1: BLOCKS[0] is a space, which punches a hole in the bar
+            ch, attr = BLOCKS[max(1, int(frac * 8))], theme.grad(t, palette)
+        else:
+            ch, attr = empty_char, theme.c(P_FRAME)
+        safe_addstr(win, y, x + i, ch, attr)
+
+
+# ---------------------------------------------------------------------------
+# Application
+# ---------------------------------------------------------------------------
+
+SORTS = ["chip", "value", "name"]
+SORT_LABELS = {"chip": "chip", "value": "value", "name": "name"}
+
+
+class App:
+    def __init__(self, source, args, cfg: Optional[Config] = None):
+        self.src = source
+        self.cfg = cfg or Config.load(getattr(args, "config", CONFIG_PATH))
+        self.interval = args.interval
+        self.fahrenheit = args.fahrenheit
+        self.temps_only = args.temps_only
+        self.mono = getattr(args, "mono", False)
+        self.theme = Theme(False)
+        self.stats: dict[str, Stats] = {}
+        self.readings: list[Reading] = []
+        self.rows: list[tuple] = []  # ("chip", name) or ("sensor", Reading)
+        self.sel = 0
+        # the startup selection: the saved sensor, and when it is missing, the
+        # top of the role ranking. It is restored once, on the first non-empty
+        # set; after that the arrow keys belong to the user.
+        self.want_sel = getattr(args, "selected", "") or ""
+        self.sel_restored = False
+        self.offset = 0
+        self.sort = getattr(args, "sort", "chip") or "chip"
+        self.filter = ""
+        self.filter_mode = False
+        self.show_help = False
+        # the limit scale by default: the chart should show the distance to the
+        # limit, not the shape of the noise. `a` switches to autoscaling.
+        self.autoscale = False
+        # the time window of the history panel (an index into WINDOWS) and the
+        # right-panel toggle: one sensor's history, or a dual-axis view of the chip
+        self.window = int(clamp(getattr(args, "window", 0) or 0, 0, len(WINDOWS) - 1))
+        self.dual = bool(getattr(args, "dual", False))
+        # buckets are computed once per sample, not once per frame (the loop draws ~30x/s)
+        self._buckets: dict[tuple, list] = {}
+        self.ascii = getattr(args, "ascii", False)
+        self.braille = not self.ascii  # verified once curses has started
+        self.paused = False
+        self.last_read = 0.0
+        self.samples = 0
+        self.host = socket.gethostname()
+        self.err: Optional[str] = None
+        self.namer = ChipNamer(self.cfg.aliases)
+        self.prio = PriorityMap(self.cfg.priorities)
+        self.refs = SysfsRefs(getattr(args, "hwmon_root", "/sys/class/hwmon"))
+        self.show_dead = getattr(args, "show_dead", False)
+        self.dead_after = getattr(args, "dead_after", 20)
+        self.hide_stale = getattr(args, "hide_stale", False)
+        # the lower bound can be dynamic: (None, 130.0) => compute it from the readings
+        self.temp_range = getattr(args, "temp_range", (None, TEMP_PHYSICAL[1]))
+        self.floor_margin = getattr(args, "floor_margin", TEMP_FLOOR_MARGIN)
+        self.floor = self.temp_range[0]
+        self.hide_dupes = getattr(args, "hide_duplicates", False)
+        self.dupes: dict[str, str] = {}  # duplicate key -> canonical key
+        self.hide_pats: list[str] = list(self.cfg.hidden)  # hidden manually
+        self.sel_key: Optional[str] = None  # what the user picked; `sel` is only its row
+        self.hidden_rows: list[tuple[Reading, str]] = []  # (sensor, reason)
+        self.hidden = 0
+        self.show_hidden = False
+        self.status: Optional[str] = None  # the footer message
+        self.status_until = 0.0
+        if self.cfg.error:
+            self.status, self.status_until = f"config: {self.cfg.error}", time.time() + 8
+
+    # -- data ---------------------------------------------------------------
+
+    def poll(self) -> None:
+        try:
+            data = self.src.read()
+        except Exception as exc:  # noqa: BLE001
+            self.err = f"read error: {exc}"
+            return
+        if not data:
+            self.err = "no readings from `sensors` (check `sensors-detect`)"
+            return
+        self.err = None
+        self.ingest(data)
+
+    def ingest(self, data: list[Reading]) -> None:
+        """Takes in a sample: history, aliases, the lower floor, duplicates."""
+        if self.temps_only:
+            data = [r for r in data if r.kind == "temp"]
+        self.readings = data
+        for r in data:
+            st = self.stats.setdefault(r.key, Stats())
+            if r.valid:  # NaN must not reach min/max/mean
+                st.push(r.value)
+        self.namer.rebuild([r.chip for r in data])
+        self.floor = (
+            dynamic_floor(data, self.floor_margin)
+            if self.temp_range[0] is None
+            else self.temp_range[0]
+        )
+        self.find_duplicates()
+        self._buckets.clear()  # the history changed - the aggregates need recomputing
+        self.samples += 1
+        self.last_read = time.time()
+
+    def range_now(self) -> tuple[float, float]:
+        """The range considered physically possible for this sample."""
+        return (self.floor if self.floor is not None else TEMP_PHYSICAL[0], self.temp_range[1])
+
+    def dead(self, r: Reading) -> Optional[str]:
+        pat = self.hidden_by_user(r)
+        if pat:
+            return f"hidden manually ({pat})"
+        return dead_reason(
+            r,
+            self.stats.setdefault(r.key, Stats()),
+            self.dead_after,
+            self.range_now(),
+            self.hide_stale,
+        )
+
+    def hidden_by_user(self, r: Reading) -> Optional[str]:
+        """The [hidden] pattern matching the sensor, or None."""
+        name = sensor_id(r)
+        return next((p for p in self.hide_pats if fnmatch.fnmatch(name, p)), None)
+
+    def toggle_hidden(self, r: Reading) -> str:
+        """Hides/unhides a sensor. Returns the footer message."""
+        name = sensor_id(r)
+        matching = [p for p in self.hide_pats if fnmatch.fnmatch(name, p)]
+        exact = glob.escape(name)  # a name with `[` must match itself as a pattern
+        if matching:
+            self.hide_pats = [p for p in self.hide_pats if p not in matching]
+            extra = " (pattern)" if matching != [exact] else ""
+            return f"unhid {self.namer.qualified(r)}{extra} - `W` saves"
+        self.hide_pats.append(exact)
+        return f"hid {self.namer.qualified(r)} - `W` saves"
+
+    def save_config(self) -> str:
+        """Dumps the current UI state into config.toml. Returns the footer message."""
+        cfg = self.cfg
+        lo, hi = self.temp_range
+        sel = self.selected()
+        cfg.ui.update(
+            {
+                "sort": self.sort,
+                "interval": float(self.interval),
+                "fahrenheit": self.fahrenheit,
+                "temps_only": self.temps_only,
+                "hide_duplicates": self.hide_dupes,
+                "show_dead": self.show_dead,
+                "hide_stale": self.hide_stale,
+                "mono": self.mono,
+                "ascii": self.ascii,
+                "window": int(self.window),
+                "dual": self.dual,
+                # an empty sensor list is not a user decision - in that case we
+                # keep writing whatever was already in the file
+                "selected": sensor_id(sel) if sel is not None else self.want_sel,
+            }
+        )
+        cfg.temps.update(
+            {
+                "range": f"{'auto' if lo is None else f'{lo:g}'}:{hi:g}",
+                "floor_margin": float(self.floor_margin),
+                "dead_after": int(self.dead_after),
+            }
+        )
+        cfg.hidden = list(self.hide_pats)
+        if not cfg.priorities:
+            # the first save: the map should be visible and editable in the file
+            # rather than buried in the code - that is what [priorities] is for
+            cfg.priorities = list(DEFAULT_PRIORITIES)
+        if not cfg.aliases:
+            # the first save: list the detected chips, so the file can be edited
+            cfg.aliases = detected_aliases(self.namer, [r.chip for r in self.readings])
+        try:
+            cfg.save()
+        except OSError as exc:
+            return f"could not save {cfg.path}: {exc.strerror or exc}"
+        return f"saved {cfg.path}"
+
+    def find_duplicates(self) -> None:
+        """Detects the same measurement read two ways (k10temp Tctl vs nct6799 TSI0).
+
+        The criterion is purely quantitative (see `mirrors`): agreement of the
+        readings over time, regardless of adapter and label. The reading with
+        the hwmon limit stays canonical, the other one gets the ≡ marker.
+
+        The only restriction beyond `mirrors`: pairs from the same chip are
+        skipped. Two cores of the same CPU are entitled to identical
+        temperatures and are still two sensors.
+        """
+        temps = [r for r in self.readings if r.kind == "temp" and r.valid]
+        dupes: dict[str, str] = {}
+        for i, a in enumerate(temps):
+            for b in temps[i + 1 :]:
+                if a.chip == b.chip or b.key in dupes or a.key in dupes:
+                    continue
+                if mirrors(self.stats[a.key].hist, self.stats[b.key].hist):
+                    first, second = sorted((a, b), key=self._dupe_rank)
+                    dupes[second.key] = first.key
+        self.dupes = dupes
+
+    @staticmethod
+    def _dupe_rank(r: Reading) -> tuple:
+        # the canonical one is the one with the hwmon limit (i.e. the "proper" driver)
+        has_limit = r.high is not None or r.crit is not None
+        return (0 if has_limit else 1, r.chip, r.label)
+
+    def dupe_of(self, r: Reading) -> Optional[Reading]:
+        canon = self.dupes.get(r.key)
+        if not canon:
+            return None
+        return next((x for x in self.readings if x.key == canon), None)
+
+    def build_rows(self) -> None:
+        flt = self.filter.lower()
+        alive: list[Reading] = []
+        hidden: list[tuple[Reading, str]] = []
+        for r in self.readings:
+            why = self.dead(r)
+            if why is None and self.hide_dupes and r.key in self.dupes:
+                canon = self.dupe_of(r)
+                why = f"duplicate of {self.namer.qualified(canon)}" if canon else "duplicate"
+            if why is None or self.show_dead:
+                alive.append(r)
+            if why is not None:
+                hidden.append((r, why))
+        self.hidden_rows = hidden
+        self.hidden = len(hidden)
+        items = [
+            r
+            for r in alive
+            if not flt
+            or flt in r.label.lower()
+            or flt in r.chip.lower()
+            or flt in self.namer.alias(r.chip).lower()
+        ]
+        rows: list[tuple] = []
+        if self.sort == "chip":
+            chips: dict[str, list[Reading]] = {}
+            for r in items:
+                chips.setdefault(r.chip, []).append(r)
+            for chip, lst in chips.items():
+                lst.sort(key=lambda r: (KIND_ORDER.get(r.kind, 9), r.label))
+                rows.append(("chip", chip))
+                rows.extend(("sensor", r) for r in lst)
+        else:
+            if self.sort == "value":
+                # descending by reading, within the sensor kind
+                items = sorted(
+                    items, key=lambda r: (KIND_ORDER.get(r.kind, 9), -r.value)
+                )
+            else:
+                items = sorted(items, key=lambda r: (r.label.lower(), r.chip))
+            rows.extend(("sensor", r) for r in items)
+        self.rows = rows
+        self.apply_selection()
+
+    def apply_selection(self) -> None:
+        """Keeps the selection inside the list, and sets it itself at startup.
+
+        The first sensor of the list is an accident - that is how the adapter
+        order falls out in hwmon, not a hierarchy of importance. So on the
+        first non-empty set we take the sensor saved in [ui], and when it is
+        missing (or gone from the hardware), the top of the [priorities] ranking.
+        """
+        n = self.sensor_count()
+        if not n:
+            self.sel = 0
+            return  # an empty list is not a choice - the restore is still ahead
+        if not self.sel_restored:
+            self.sel = self.initial_index()
+            self.sel_restored = True
+            self.remember_selection()
+        else:
+            # follow the sensor across re-sorts; while it is filtered out or gone,
+            # keep the row and the key, so it is picked up again when it returns
+            visible = (v for k, v in self.rows if k == "sensor")
+            row = next((i for i, r in enumerate(visible) if r.key == self.sel_key), None)
+            if row is not None:
+                self.sel = row
+        self.sel = int(clamp(self.sel, 0, n - 1))
+
+    def remember_selection(self) -> None:
+        r = self.selected()
+        self.sel_key = r.key if r is not None else None
+
+    def initial_index(self) -> int:
+        """The index of the sensor that should be selected at startup."""
+        visible = [v for k, v in self.rows if k == "sensor"]
+        if self.want_sel:
+            for i, r in enumerate(visible):
+                if sensor_id(r) == self.want_sel:
+                    return i
+        return min(range(len(visible)), key=lambda i: self.rank(visible[i]))
+
+    def rank(self, r: Reading) -> tuple:
+        """The sensor's place in the role ranking (see [priorities] and `rank_key`)."""
+        st = self.stats.get(r.key) or Stats()
+        return rank_key(r, self.prio.klass(r), ratio_of(r, st, self.refs))
+
+    def sensor_count(self) -> int:
+        return sum(1 for k, _ in self.rows if k == "sensor")
+
+    def selected(self) -> Optional[Reading]:
+        i = 0
+        for kind, val in self.rows:
+            if kind == "sensor":
+                if i == self.sel:
+                    return val
+                i += 1
+        return None
+
+    # -- formatting ---------------------------------------------------------
+
+    def fmt(self, r: Reading, value: Optional[float] = None) -> str:
+        v = r.value if value is None else value
+        if math.isnan(v):
+            return "      —"
+        if r.kind == "temp":
+            if self.fahrenheit:
+                return f"{to_f(v):5.1f}°F"
+            return f"{v:5.1f}°C"
+        if r.kind == "fan":
+            return f"{v:5.0f} RPM"
+        if r.kind == "freq":
+            return fmt_freq(v)
+        if r.kind == "in":
+            return f"{v:6.3f} V"
+        if r.kind == "power":
+            return f"{v:5.1f} W"
+        if r.kind == "curr":
+            return f"{v:5.2f} A"
+        return f"{v:6.1f}{r.unit}"
+
+    # -- the main loop ------------------------------------------------------
+
+    def run(self, stdscr) -> None:
+        curses.curs_set(0)
+        stdscr.nodelay(True)
+        stdscr.keypad(True)
+        self.theme = Theme(init_colors(self.mono))
+        # --ascii forces the fallback; otherwise we check whether the terminal
+        # can handle braille - a POSIX/latin1 locale would print garbage instead
+        self.braille = not self.ascii and braille_supported(stdscr)
+        if not self.braille and not self.ascii:
+            self.set_status("terminal without braille support - ASCII charts", 6.0)
+        self.poll()
+        next_read = time.time() + self.interval
+        while True:
+            now = time.time()
+            if not self.paused and now >= next_read:
+                self.poll()
+                next_read = now + self.interval
+            self.build_rows()
+            self.draw(stdscr)
+            ch = stdscr.getch()
+            if ch != -1 and not self.handle_key(ch, stdscr):
+                return
+            if ch == -1:
+                time.sleep(0.03)
+
+    def handle_key(self, ch: int, stdscr) -> bool:
+        """Returns False when the program should quit."""
+        if self.filter_mode:
+            if ch in (27, curses.KEY_EXIT):
+                self.filter, self.filter_mode = "", False
+            elif ch in (10, 13, curses.KEY_ENTER):
+                self.filter_mode = False
+            elif ch in (curses.KEY_BACKSPACE, 127, 8):
+                self.filter = self.filter[:-1]
+            elif 32 <= ch < 127:
+                self.filter += chr(ch)
+            return True
+
+        if (self.show_help or self.show_hidden) and ch != curses.KEY_RESIZE:
+            self.show_help = self.show_hidden = False
+            return True
+
+        n = max(self.sensor_count(), 1)
+        sel_before = self.sel
+        if ch in (ord("q"), ord("Q"), 27):
+            return False
+        elif ch in (curses.KEY_DOWN, ord("j")):
+            self.sel = (self.sel + 1) % n
+        elif ch in (curses.KEY_UP, ord("k")):
+            self.sel = (self.sel - 1) % n
+        elif ch == curses.KEY_NPAGE:
+            self.sel = int(clamp(self.sel + 10, 0, n - 1))
+        elif ch == curses.KEY_PPAGE:
+            self.sel = int(clamp(self.sel - 10, 0, n - 1))
+        elif ch == curses.KEY_HOME:
+            self.sel = 0
+        elif ch == curses.KEY_END:
+            self.sel = n - 1
+        elif ch in (ord("s"), ord("S")):
+            self.sort = SORTS[(SORTS.index(self.sort) + 1) % len(SORTS)]
+        elif ch == ord("/"):
+            self.filter_mode = True
+        elif ch in (ord("c"), ord("C")):
+            self.fahrenheit = not self.fahrenheit
+        elif ch in (ord("a"), ord("A")):
+            self.autoscale = not self.autoscale
+        elif ch in (ord("t"), ord("T")):
+            self.temps_only = not self.temps_only
+            if self.paused:  # a poll would record a sample during the pause
+                self.set_status("applies after resuming", 3.0)
+            else:
+                self.poll()
+        elif ch in (ord("z"), ord("Z")):
+            self.show_dead = not self.show_dead
+        elif ch in (ord("h"), ord("H")):
+            self.show_hidden = True
+        elif ch in (ord("d"), ord("D")):
+            self.hide_dupes = not self.hide_dupes
+        elif ch in (ord("x"), ord("X")):
+            r = self.selected()
+            if r is not None:
+                self.set_status(self.toggle_hidden(r))
+        elif ch == ord("w"):
+            self.window = (self.window + 1) % len(WINDOWS)
+            self.set_status(f"window {self.window_label()}", 2.5)
+        elif ch == ord("W"):
+            self.set_status(self.save_config(), 6.0)
+        elif ch in (ord("u"), ord("U")):
+            self.dual = not self.dual
+            if stdscr is not None and stdscr.getmaxyx()[1] < 84:
+                # the right column is not drawn at all then - without this
+                # message the key looks broken
+                self.set_status("the chip panel needs >= 84 columns", 4.0)
+        elif ch in (ord("+"), ord("=")):
+            self.interval = round(min(self.interval + 0.5, 60.0), 1)
+        elif ch == ord("-"):
+            self.interval = round(max(self.interval - 0.5, 0.5), 1)
+        elif ch in (ord("r"), ord("R")):
+            for st in self.stats.values():
+                st.reset()
+                st.hist.clear()
+            self._buckets.clear()
+            self.samples = 0
+        elif ch == ord(" "):
+            self.paused = not self.paused
+        elif ch in (ord("?"), curses.KEY_F1):
+            self.show_help = True
+        elif ch == curses.KEY_RESIZE:
+            stdscr.clear()
+        if self.sel != sel_before:
+            self.remember_selection()
+        return True
+
+    def set_status(self, msg: str, secs: float = 4.0) -> None:
+        self.status, self.status_until = msg, time.time() + secs
+
+    # -- chart renderers (braille or ASCII) ---------------------------------
+
+    def area(self, series, width: int, height: int, lo: float, hi: float) -> list[str]:
+        if self.braille:
+            return braille_area(series, width, height, lo, hi)
+        return ascii_area(series, width, height, lo, hi)
+
+    def spark(self, series, width: int) -> str:
+        return braille_line(series, width) if self.braille else ascii_line(series, width)
+
+    def band(self, cols, width, height, lo, hi, repeat=1, fill=True, down=False):
+        return band_area(
+            cols, width, height, lo, hi, repeat,
+            braille=self.braille, band=fill, down=down,
+        )
+
+    # -- time windows -------------------------------------------------------
+
+    @property
+    def bucket(self) -> int:
+        """How many samples go into one bucket in the current window (1 = raw)."""
+        return WINDOWS[self.window]
+
+    def window_label(self) -> str:
+        """The window resolution computed from the interval - not a hardcoded '30 s'.
+
+        At `-i 1` a 15-sample bucket is 15 seconds and should be labelled as
+        such; the label has to say what is actually on screen.
+        """
+        return fmt_span(self.bucket * self.interval)
+
+    def buckets(self, key: str, bucket: int) -> list:
+        """A sensor's buckets for the given window - computed once per sample, not per frame."""
+        ck = (key, bucket)
+        got = self._buckets.get(ck)
+        if got is None:
+            st = self.stats.get(key)
+            got = aggregate(st.hist, bucket) if st is not None else []
+            self._buckets[ck] = got
+        return got
+
+    @staticmethod
+    def bucket_width(bucket: int, slots: int) -> int:
+        """The bucket width in slots, so a full buffer fills the panel.
+
+        At 1 slot each, six five-minute buckets would take three cells at the
+        right edge and leave the rest of the panel empty - so we stretch them
+        instead of pretending there is less data.
+        """
+        return max(1, slots // max(1, HISTORY_CAP // bucket))
+
+    def slots_of(self, width: int) -> int:
+        """How many samples/buckets fit horizontally: braille has 2 per cell."""
+        return width * (2 if self.braille else 1)
+
+    # -- views --------------------------------------------------------------
+
+    def draw(self, stdscr) -> None:
+        stdscr.erase()
+        h, w = stdscr.getmaxyx()
+        if h < 8 or w < 40:
+            safe_addstr(stdscr, 0, 0, "Terminal too small (min. 40x8)", self.theme.c(P_WARN))
+            stdscr.refresh()
+            return
+
+        self.draw_header(stdscr, w)
+
+        body_y, body_h = 1, h - 2
+        wide = w >= 84
+        left_w = int(w * 0.58) if wide else w
+        self.draw_list(stdscr, body_y, 0, body_h, left_w)
+        if wide:
+            right_x = left_w
+            right_w = w - left_w
+            graph_h = max(7, int(body_h * 0.55))
+            info_h = body_h - graph_h
+            if info_h < 6:
+                graph_h, info_h = body_h - 6, 6
+            self.draw_graph(stdscr, body_y, right_x, graph_h, right_w)
+            self.draw_info(stdscr, body_y + graph_h, right_x, info_h, right_w)
+
+        self.draw_footer(stdscr, h - 1, w)
+        if self.show_help:
+            self.draw_help(stdscr, h, w)
+        elif self.show_hidden:
+            self.draw_hidden(stdscr, h, w)
+        stdscr.refresh()
+
+    def draw_hidden(self, win, h, w) -> None:
+        """The list of rejected sensors with the reason - so hiding stays checkable."""
+        th = self.theme
+        rows = self.hidden_rows
+        bw = min(w - 4, 76)
+        max_rows = max(3, min(len(rows), h - 6))
+        bh = max_rows + 4
+        by = max(0, (h - bh) // 2)
+        bx = max(0, (w - bw) // 2)
+        for i in range(bh):
+            safe_addstr(win, by + i, bx, " " * bw, th.c(P_TEXT))
+        lo, hi = self.range_now()
+        auto = " auto" if self.temp_range[0] is None else ""
+        title = f"hidden sensors ({len(rows)}) · floor{auto} {lo:g}-{hi:g} °C"
+        draw_box(win, by, bx, bh, bw, title, th)
+
+        if not rows:
+            safe_addstr(win, by + 1, bx + 2, "nothing is hidden", th.c(P_DIM))
+        name_w = 26
+        val_w = 10
+        for i, (r, why) in enumerate(rows[:max_rows]):
+            yy = by + 1 + i
+            safe_addstr(
+                win, yy, bx + 2, ellipsis(self.namer.qualified(r), name_w), th.c(P_TEXT)
+            )
+            safe_addstr(
+                win, yy, bx + 2 + name_w, self.fmt(r).rjust(val_w), th.c(P_DIM)
+            )
+            safe_addstr(
+                win,
+                yy,
+                bx + 3 + name_w + val_w,
+                ellipsis(why, bw - name_w - val_w - 6),
+                th.c(P_WARN),
+            )
+        if len(rows) > max_rows:
+            safe_addstr(
+                win,
+                by + bh - 3,
+                bx + 2,
+                f"…and {len(rows) - max_rows} more (press z to show them all)",
+                th.c(P_DIM),
+            )
+        safe_addstr(win, by + bh - 2, bx + 2, "any key - back", th.c(P_DIM))
+
+    def header_temps(self) -> list[Reading]:
+        """The temperatures behind the header's max/avg - never an unreadable one."""
+        return [
+            r
+            for r in self.readings
+            if r.kind == "temp" and r.valid and (self.show_dead or not self.dead(r))
+        ]
+
+    def draw_header(self, win, w: int) -> None:
+        th = self.theme
+        title = f" sensortop {VERSION} "
+        safe_addstr(win, 0, 1, title, th.c(P_TITLE) | curses.A_BOLD)
+        x = 1 + len(title) + 1
+        safe_addstr(win, 0, x, self.host, th.c(P_HDR) | curses.A_BOLD)
+        x += len(self.host) + 2
+
+        temps = self.header_temps()
+        if temps:
+            # hottest = the highest reading, not "closest to its limit" -
+            # otherwise a sensor with a low limit beats a genuinely warmer one
+            hottest = max(temps, key=lambda r: r.value)
+            avg = sum(r.value for r in temps) / len(temps)
+            st = self.stats.get(hottest.key, Stats())
+            info = f"max {self.namer.qualified(hottest)} {self.fmt(hottest)}"
+            ratio = ratio_of(hottest, st, self.refs) or 0.0
+            safe_addstr(win, 0, x, info, th.grad(ratio) | curses.A_BOLD)
+            x += len(info) + 2
+            a = Reading("", "", "", "temp", avg)
+            txt = f"avg {self.fmt(a, avg)}"
+            safe_addstr(win, 0, x, txt, th.c(P_DIM))
+            x += len(txt) + 2
+
+        right = time.strftime("%H:%M:%S")
+        load = self.loadavg()
+        if load:
+            right = f"load {load}  {right}"
+        if self.paused:
+            right = "[PAUSED]  " + right
+        safe_addstr(win, 0, max(x, w - len(right) - 1), right, th.c(P_DIM))
+
+    @staticmethod
+    def loadavg() -> str:
+        try:
+            with open("/proc/loadavg", encoding="ascii") as fh:
+                p = fh.read().split()
+            return f"{p[0]} {p[1]} {p[2]}"
+        except OSError:
+            return ""
+
+    def draw_list(self, win, y, x, h, w) -> None:
+        th = self.theme
+        title = f"sensors [{SORT_LABELS[self.sort]}]"
+        if self.filter:
+            title += f" /{self.filter}"
+        if self.hidden:
+            title += f" · {self.hidden} hidden"
+        elif self.show_dead:
+            title += " · incl. dead"
+        draw_box(win, y, x, h, w, title, th)
+        inner_h, inner_w = h - 2, w - 4
+        if inner_h <= 0 or inner_w <= 10:
+            return
+
+        # scrolling: find the row index of the selected sensor
+        sel_row, seen = 0, 0
+        for i, (kind, _v) in enumerate(self.rows):
+            if kind == "sensor":
+                if seen == self.sel:
+                    sel_row = i
+                    break
+                seen += 1
+        if sel_row < self.offset:
+            self.offset = sel_row
+        elif sel_row >= self.offset + inner_h:
+            self.offset = sel_row - inner_h + 1
+        self.offset = int(clamp(self.offset, 0, max(0, len(self.rows) - inner_h)))
+
+        # column widths
+        val_w = 11
+        spark_w = 10 if inner_w > 74 else 0
+        lbl_w = max(10, min(20, inner_w - val_w - spark_w - 14))
+        bar_w = inner_w - lbl_w - val_w - spark_w - 3
+
+        idx = 0  # the sensor number (to compare against self.sel)
+        cur = -1
+        row_y = y + 1
+        drawn = 0
+        for i, (kind, val) in enumerate(self.rows):
+            if kind == "sensor":
+                cur = idx
+                idx += 1
+            if i < self.offset:
+                continue
+            if drawn >= inner_h:
+                break
+            yy = row_y + drawn
+            drawn += 1
+            if kind == "chip":
+                alias = self.namer.alias(val)
+                safe_addstr(win, yy, x + 2, "▎", th.c(P_HDR) | curses.A_BOLD)
+                safe_addstr(
+                    win, yy, x + 3, ellipsis(alias, inner_w - 2), th.c(P_HDR) | curses.A_BOLD
+                )
+                sx = x + 3 + len(alias) + 1
+                safe_addstr(win, yy, sx, ellipsis(val, x + w - 12 - sx), th.c(P_FRAME))
+                cnt = sum(1 for k, v in self.rows if k == "sensor" and v.chip == val)
+                tag = f"{cnt} sens."
+                safe_addstr(win, yy, x + w - 2 - len(tag), tag, th.c(P_FRAME))
+                continue
+
+            r: Reading = val
+            st = self.stats.setdefault(r.key, Stats())
+            ratio = ratio_of(r, st, self.refs)
+            alarm = alarm_level(r)
+            pal = palette_of(r)
+            sel = cur == self.sel
+            is_dead = self.dead(r) is not None
+
+            # with a sort other than by chip the label alone can mislead
+            # ("mem" - RAM or GPU memory?), so we add the chip alias
+            name = r.label if self.sort == "chip" else self.namer.qualified(r)
+            if r.key in self.dupes:
+                name = "≡" + name  # the same measurement as another sensor
+            marker = "▶" if sel else " "
+            name_attr = th.c(P_SEL) | curses.A_BOLD if sel else th.c(P_TEXT)
+            if is_dead:
+                name_attr = th.c(P_FRAME)
+            safe_addstr(win, yy, x + 1, marker, th.c(P_SEL) | curses.A_BOLD)
+            safe_addstr(win, yy, x + 2, ellipsis(name, lbl_w).ljust(lbl_w), name_attr)
+
+            bx = x + 2 + lbl_w + 1
+            if bar_w > 3:
+                if is_dead or ratio is None:
+                    # no reference = no bar; an empty space beats a fill that
+                    # pretends to be information
+                    safe_addstr(win, yy, bx, "·" * bar_w, th.c(P_FRAME))
+                else:
+                    draw_bar(win, yy, bx, bar_w, ratio, th, palette=pal)
+
+            # the gradient stays on the bar; the value text keeps a fixed, readable colour
+            if is_dead:
+                vattr = th.c(P_FRAME)
+            elif alarm == 2:
+                vattr = th.c(P_CRIT) | curses.A_BOLD | curses.A_REVERSE
+            elif alarm == 1:
+                vattr = th.c(P_WARN) | curses.A_BOLD
+            elif r.kind == "temp":
+                vattr = th.grad(ratio or 0.0, pal) | curses.A_BOLD
+            else:
+                vattr = th.c(P_VALUE) | curses.A_BOLD
+            safe_addstr(win, yy, bx + bar_w + 1, self.fmt(r).rjust(val_w), vattr)
+
+            if spark_w:
+                sx = bx + bar_w + 1 + val_w + 1
+                spark = "" if is_dead else self.spark(st.hist, spark_w)
+                sattr = (
+                    th.grad(ratio or 0.0, pal)
+                    if r.kind == "temp"
+                    else th.c(P_ACCENT)
+                )
+                safe_addstr(win, yy, sx, spark, sattr)
+
+        if len(self.rows) > inner_h:
+            info = f"{self.offset + 1}-{min(self.offset + inner_h, len(self.rows))}/{len(self.rows)}"
+            safe_addstr(win, y + h - 1, x + w - len(info) - 3, f" {info} ", th.c(P_FRAME))
+
+    def draw_graph(self, win, y, x, h, w) -> None:
+        if self.dual:
+            self.draw_dual(win, y, x, h, w)
+            return
+        th = self.theme
+        r = self.selected()
+        span = self.window_label()
+        if r is None:
+            draw_box(win, y, x, h, w, f"history {span}", th)
+            safe_addstr(win, y + 1, x + 2, "no sensors", th.c(P_DIM))
+            return
+        st = self.stats.setdefault(r.key, Stats())
+        draw_box(win, y, x, h, w, f"history {span} - {self.namer.qualified(r)}", th)
+
+        gh, gw = h - 2, w - 9
+        if gh <= 0 or gw <= 4:
+            return
+        data = list(st.hist)
+        if not data:
+            safe_addstr(win, y + 1, x + 2, "collecting data…", th.c(P_DIM))
+            return
+
+        lo, hi, scale_name = self.graph_scale(r, st, data)
+
+        pal = palette_of(r)
+        thr = graph_threshold(r)
+        # the limit row is computed before drawing, so the line lands in the
+        # same grid as the chart (and not next to it)
+        thr_row = row_at(thr[0], lo, hi, gh) if thr else None
+        bucket, slots = self.bucket, self.slots_of(gw)
+        if bucket == 1:
+            # the raw window stays an area chart: with one sample per slot the
+            # min-max band would be a line of zero height
+            rows = self.area(data, gw, gh, lo, hi)
+            marks: list[list[int]] = [[]] * gh
+            shown = min(len(data), slots)
+        else:
+            cols = self.buckets(r.key, bucket)
+            step = self.bucket_width(bucket, slots)
+            rows, marks = self.band(cols, gw, gh, lo, hi, step)
+            shown = min(len(cols), max(1, slots // step))
+        mean_attr = th.c(P_ACCENT) | curses.A_BOLD
+        blank, rule = ("⠀", "─") if self.braille else (" ", "-")
+        for i, line in enumerate(rows):
+            # vertical gradient: the top of the chart = a higher value = a warmer colour
+            t = 1.0 - (i / max(gh - 1, 1))
+            if r.kind == "temp":
+                attr = th.grad(t * ratio_scale(r, hi), pal)
+            else:
+                # the cool palette only in its bright half - the bottom of the
+                # chart has to stay readable on a black background too
+                attr = th.grad(0.45 + 0.55 * t, pal)
+            if i == thr_row:
+                # the limit line only where there is no data: the chart fill is
+                # meant to cover it, because exceeding the limit is exactly what
+                # you see when the fill reaches above the line
+                for col, ch in enumerate(line):
+                    if ch == blank:
+                        safe_addstr(win, y + 1 + i, x + 2 + col, rule, th.c(P_WARN))
+                    else:
+                        safe_addstr(win, y + 1 + i, x + 2 + col, ch, attr)
+            else:
+                safe_addstr(win, y + 1 + i, x + 2, line, attr)
+            # the mean goes on top of the band: the same character, a different
+            # colour - otherwise an aggregated window shows only the spread
+            for col in marks[i]:
+                safe_addstr(win, y + 1 + i, x + 2 + col, line[col], mean_attr)
+
+        # the Y axis
+        for i in range(gh):
+            frac = 1.0 - (i / max(gh - 1, 1))
+            v = lo + (hi - lo) * frac
+            if i == thr_row:
+                lab = self.axis_label(r, thr[0])
+                safe_addstr(win, y + 1 + i, x + w - 8, lab.rjust(7), th.c(P_WARN) | curses.A_BOLD)
+            elif i == 0 or i == gh - 1 or (gh > 4 and i == gh // 2):
+                lab = self.axis_label(r, v)
+                safe_addstr(win, y + 1 + i, x + w - 8, lab.rjust(7), th.c(P_DIM))
+
+        # the caption talks about what is on screen, not about what is in the
+        # buffer: with a 30 s window "60x30 s = 30 min" is not "900 samples"
+        if bucket == 1:
+            covered, label = shown, f"{self.interval:g}s"
+        else:
+            # the leftmost bucket can be incomplete, so "shown x bucket" may
+            # promise more history than exists - count the real samples instead
+            covered = len(data) if shown >= len(cols) else shown * bucket
+            label = fmt_span(bucket * self.interval)
+        note = f"{shown}×{label} = {fmt_span(covered * self.interval)} · {scale_name}"
+        safe_addstr(win, y + h - 1, x + 2, f" {note} "[: w - 4], th.c(P_FRAME))
+
+    def graph_scale(self, r: Reading, st: Stats, data: list) -> tuple[float, float, str]:
+        """The vertical range of the chart and a description of its source."""
+        fixed = graph_range(r, st, self.refs)
+        if not self.autoscale and fixed is not None:
+            lo, hi, src = fixed
+            # a reading above the limit must not be clipped to the ceiling -
+            # otherwise overheating looks just like hitting the limit exactly
+            top = max(data)
+            if top > hi:
+                hi = top * 1.02
+            return lo, hi, f"{src} {self.fmt(r, fixed[1]).strip()}"
+        lo, hi = min(data), max(data)
+        pad = max((hi - lo) * 0.15, abs(hi) * 0.02 + 0.5)
+        if fixed is None and not self.autoscale:
+            why = "no limit" if r.kind == "temp" else "no reference"
+            return lo - pad, hi + pad, f"auto ({why})"
+        return lo - pad, hi + pad, "auto"
+
+    def axis_label(self, r: Reading, v: float) -> str:
+        if r.kind == "temp":
+            return f"{to_f(v):.0f}F" if self.fahrenheit else f"{v:.0f}°"
+        if r.kind == "fan":
+            return f"{v:.0f}"
+        if r.kind == "freq":
+            return fmt_freq(v).replace(" ", "").rstrip("z").rstrip("H")
+        if r.kind == "in":
+            return f"{v:.2f}V"
+        return f"{v:.1f}"
+
+    # -- the dual-axis panel ------------------------------------------------
+
+    def dual_series(self, chip: str) -> tuple[list, list, int]:
+        """The chip's temperatures and fans + how many series did not fit.
+
+        The source is `self.rows`, so the panel respects the filter, the hidden
+        list and dedupe: a sensor hidden from the list has no business coming
+        back through a side door. The order is the same role ranking that picks
+        the sensor at startup - so the least relevant series drop out of the
+        panel, not simply the ones hwmon listed last.
+        """
+        shown = [v for k, v in self.rows if k == "sensor" and v.chip == chip and v.valid]
+        temps = sorted((s for s in shown if s.kind == "temp"), key=self.rank)
+        fans = sorted((s for s in shown if s.kind == "fan"), key=self.rank)
+        cut = max(0, len(temps) - DUAL_MAX) + max(0, len(fans) - DUAL_MAX)
+        return temps[:DUAL_MAX], fans[:DUAL_MAX], cut
+
+    def dual_top(self, series: list, temp: bool) -> float:
+        """The upper bound of one half of the panel: the highest reference in the group.
+
+        All series in one half share a scale - otherwise two charts side by
+        side would mean different things and comparing 'which fan spins faster'
+        would be an illusion.
+        """
+        top = 0.0
+        for s in series:
+            ref = temp_top(s)[0] if temp else (reference_top(s, self.refs) or (0.0,))[0]
+            top = max(top, ref or 0.0)
+            st = self.stats.get(s.key)
+            if st is not None and st.count:
+                top = max(top, st.vmax * 1.02)  # a reading above the limit must not be clipped
+        if top <= 0:
+            top = TEMP_SCALE_FALLBACK if temp else DEFAULT_FAN_TOP
+        return max(top, TEMP_SCALE_FLOOR + 20.0) if temp else top
+
+    def draw_dual(self, win, y, x, h, w) -> None:
+        """Two axes of one chip: temperatures upwards, fan speeds downwards.
+
+        The centre axis is the zero of both halves, not a shared point - °C and
+        RPM have no common unit, so each half has its own scale, described at
+        the right edge and in the panel footer.
+        """
+        th = self.theme
+        r = self.selected()
+        span = self.window_label()
+        if r is None:
+            draw_box(win, y, x, h, w, f"chip {span}", th)
+            safe_addstr(win, y + 1, x + 2, "no sensors", th.c(P_DIM))
+            return
+        chip = r.chip
+        draw_box(win, y, x, h, w, f"chip {span} - {self.namer.alias(chip)}", th)
+        gw = w - 9
+        inner = h - 2
+        if gw < 6 or inner < 4:
+            if inner >= 1:  # with two rows there is nowhere to write this
+                safe_addstr(win, y + 1, x + 2, "the panel needs a larger window", th.c(P_DIM))
+            return
+
+        temps, fans, cut = self.dual_series(chip)
+        if not temps and not fans:
+            safe_addstr(
+                win, y + 1, x + 2, "the chip has no temperatures or fans", th.c(P_DIM)
+            )
+            return
+
+        # height split: the axis and the legend take one row each, the rest is halved
+        avail = inner - 2
+        if not fans:
+            t_h, f_h = avail, 0
+        elif not temps:
+            t_h, f_h = 0, avail
+        else:
+            t_h = max(1, (avail + 1) // 2)
+            f_h = avail - t_h
+        axis_y = y + 1 + t_h
+        legend_y = y + h - 2
+        bucket, slots = self.bucket, self.slots_of(gw)
+        step = 1 if bucket == 1 else self.bucket_width(bucket, slots)
+
+        t_lo, t_hi = TEMP_SCALE_FLOOR, self.dual_top(temps, True)
+        f_hi = self.dual_top(fans, False)
+
+        def paint(series, top_y, height, lo, hi, down, attrs) -> None:
+            if height <= 0 or not series:
+                return
+            layers = []
+            for i, s in enumerate(series):
+                # the min-max band only for the selected sensor - several bands
+                # at once merge into a blob in which no series is visible
+                fill = bucket > 1 and s.key == r.key
+                grid, _mean = cell_grid(
+                    self.buckets(s.key, bucket), gw, height, lo, hi, step,
+                    band=fill, braille=self.braille, down=down,
+                )
+                layers.append((i, grid))
+            grid, owner = merge_layers(layers, gw, height)
+            for ry in range(height):
+                row, own = grid[ry], owner[ry]
+                col = 0
+                while col < gw:
+                    if not row[col]:
+                        col += 1
+                        continue
+                    who, start, chunk = own[col], col, []
+                    while col < gw and row[col] and own[col] == who:
+                        chunk.append(chr(0x2800 + row[col]) if self.braille else ASCII_FILL)
+                        col += 1
+                    safe_addstr(win, top_y + ry, x + 2 + start, "".join(chunk), attrs[who])
+
+        def temp_attr(s: Reading) -> int:
+            st = self.stats.setdefault(s.key, Stats())
+            attr = th.grad(ratio_of(s, st, self.refs) or 0.0, "heat")
+            return attr | curses.A_BOLD if s.key == r.key else attr
+
+        def fan_attr(i: int) -> int:
+            attr = th.grad(0.45 + 0.55 * (i / max(len(fans) - 1, 1)), "cool")
+            return attr | curses.A_BOLD if fans[i].key == r.key else attr
+
+        t_attrs = [temp_attr(s) for s in temps]
+        f_attrs = [fan_attr(i) for i in range(len(fans))]
+        paint(temps, y + 1, t_h, t_lo, t_hi, False, t_attrs)
+        paint(fans, axis_y + 1, f_h, 0.0, f_hi, True, f_attrs)
+
+        # the centre axis: the zero of both scales
+        safe_addstr(win, axis_y, x + 2, "─" * gw, th.c(P_FRAME))
+        if temps:
+            safe_addstr(
+                win, y + 1, x + w - 8, self.axis_label(temps[0], t_hi).rjust(7), th.c(P_DIM)
+            )
+        if fans and f_h:
+            safe_addstr(
+                win, axis_y + f_h, x + w - 8,
+                self.axis_label(fans[0], f_hi).rjust(7), th.c(P_DIM),
+            )
+        zero = "/".join(
+            ([self.axis_label(temps[0], t_lo)] if temps else []) + (["0"] if fans else [])
+        )
+        safe_addstr(win, axis_y, x + w - 8, zero.rjust(7), th.c(P_FRAME))
+
+        # the legend - without it the series colour means nothing. Fans start
+        # from the right edge: with four temperatures they would be the first to
+        # fall off the row, and they are what explains the lower half of the panel.
+        rx = x + w - 2
+        right = []
+        for s, attr in reversed(list(zip(fans, f_attrs))):
+            txt = f"{s.label} {self.fmt(s).strip()}"
+            if rx - len(txt) < x + 6:
+                break
+            rx -= len(txt)
+            right.append((rx, txt, attr))
+            rx -= 2
+        for px, txt, attr in right:
+            safe_addstr(win, legend_y, px, txt, attr)
+        cx = x + 2
+        for s, attr in zip(temps, t_attrs):
+            txt = f"{s.label} {self.fmt(s).strip()}"
+            if cx + len(txt) > rx - 2:
+                safe_addstr(win, legend_y, cx, "…", th.c(P_DIM))
+                break
+            safe_addstr(win, legend_y, cx, txt, attr)
+            cx += len(txt) + 2
+
+        note = " · ".join(
+            (
+                [f"temp {self.axis_label(temps[0], t_lo)}-{self.axis_label(temps[0], t_hi)} ▲"]
+                if temps
+                else []
+            )
+            + ([f"rpm 0-{f_hi:g} ▼"] if fans else [])
+        )
+        if cut:
+            note += f" · +{cut} off panel"
+        safe_addstr(win, y + h - 1, x + 2, f" {note} "[: w - 4], th.c(P_FRAME))
+
+    def draw_info(self, win, y, x, h, w) -> None:
+        th = self.theme
+        draw_box(win, y, x, h, w, "details", th)
+        r = self.selected()
+        if r is None or h < 4:
+            return
+        st = self.stats.setdefault(r.key, Stats())
+        yy = y + 1
+        cx = x + 2
+        iw = w - 4
+
+        lw = 11 if iw >= 34 else 9
+
+        def line(label: str, value: str, attr=None) -> None:
+            nonlocal yy
+            if yy >= y + h - 1:
+                return
+            safe_addstr(win, yy, cx, ellipsis(label, lw).ljust(lw), th.c(P_DIM))
+            safe_addstr(win, yy, cx + lw, ellipsis(value, iw - lw), attr or th.c(P_TEXT))
+            yy += 1
+
+        def val(v: float) -> str:
+            return self.fmt(r, v).strip()
+
+        alarm = alarm_level(r)
+        dead = self.dead(r)
+        state = ["OK", "WARNING", "CRITICAL"][alarm]
+        sattr = [th.c(P_GRAD), th.c(P_WARN) | curses.A_BOLD, th.c(P_CRIT) | curses.A_BOLD][
+            alarm
+        ]
+        if dead:
+            state, sattr = f"dead - {dead}", th.c(P_FRAME)
+        canon = self.dupe_of(r)
+        if canon is not None:
+            # the same character as the list marker - it shows whose reading this is
+            line("duplicate", f"≡ {self.namer.qualified(canon)}", th.c(P_ACCENT))
+        line("chip", f"{self.namer.alias(r.chip)} · {r.chip}")
+        if r.adapter and h >= 10:
+            line("adapter", r.adapter)
+        if r.kind == "temp":
+            vattr = th.grad(ratio_of(r, st, self.refs) or 0.0, "heat") | curses.A_BOLD
+        else:
+            vattr = th.c(P_VALUE) | curses.A_BOLD
+        line("now", val(r.value), vattr)
+        if st.count:
+            line("min/avg/max", f"{val(st.vmin)} / {val(st.avg)} / {val(st.vmax)}")
+        # how much history is really in the buffer - the panel shows only a
+        # slice, and min/avg/max is computed from the session start, not from
+        # those 900 samples
+        if h >= 11:
+            n = len(st.hist)
+            line("buffer", f"{n}/{st.hist.cap} samples · {fmt_span(n * self.interval)}")
+        limits = []
+        if r.high is not None:
+            limits.append(f"high {val(r.high)}")
+        if r.crit is not None:
+            limits.append(f"crit {val(r.crit)}")
+        if r.low is not None:
+            limits.append(f"min {val(r.low)}")
+        line("limits", ", ".join(limits) if limits else "-")
+        # where the bar fill comes from - otherwise 4485 RPM "almost maxed out"
+        # looks like an alarm, while it is only a position against max RPM
+        rng = scale_range(r, st, self.refs)
+        if rng is None:
+            scale_txt = "no reference - no bar"
+        elif r.kind == "temp":
+            _top, src = temp_top(r)
+            scale_txt = f"{val(rng[0])}-{val(rng[1])} ({src or 'no limit'})"
+        else:
+            src_ref = reference_top(r, self.refs)
+            scale_txt = f"0-{val(rng[1])} ({src_ref[1]})" if src_ref else f"0-{val(rng[1])}"
+        line("scale", scale_txt)
+        # the bar and the chart use the same scale, so a separate row is added
+        # only when the chart falls out of it: no limit, or autoscaling turned
+        # on by hand
+        g = graph_range(r, st, self.refs)
+        if self.autoscale:
+            line("chart", "auto (the a key)")
+        elif g is None:
+            why = "no limit" if r.kind == "temp" else "no reference"
+            line("chart", f"auto - {why}", th.c(P_WARN))
+        line("state", state, sattr)
+
+        # the global summary
+        if yy < y + h - 1:
+            shown = [v for k, v in self.rows if k == "sensor"]
+            temps = [x_ for x_ in shown if x_.kind == "temp"]
+            fans = [x_ for x_ in shown if x_.kind == "fan"]
+            warn = sum(1 for x_ in temps if alarm_level(x_) > 0)
+            summary = f"{len(shown)} sens. · {len(temps)} temp · {len(fans)} fans"
+            if self.hidden:
+                summary += f" · {self.hidden} dead"
+            safe_addstr(win, yy, cx, summary[:iw], th.c(P_FRAME))
+            yy += 1
+            if yy < y + h - 1 and warn:
+                safe_addstr(
+                    win,
+                    yy,
+                    cx,
+                    f"⚠ {warn} sensor(s) above the limit"[:iw],
+                    th.c(P_WARN) | curses.A_BOLD,
+                )
+
+    def draw_footer(self, win, y, w) -> None:
+        th = self.theme
+        if self.filter_mode:
+            prompt = f" filter: {self.filter}▏(Enter = apply, Esc = clear)"
+            safe_addstr(win, y, 0, prompt.ljust(w)[:w], th.c(P_SEL) | curses.A_BOLD)
+            return
+        if self.err:
+            safe_addstr(win, y, 0, f" ⚠ {self.err}".ljust(w)[:w], th.c(P_CRIT))
+            return
+        if self.status and time.time() < self.status_until:
+            safe_addstr(win, y, 0, f" {self.status}".ljust(w)[:w], th.c(P_SEL) | curses.A_BOLD)
+            return
+        keys = [
+            ("↑↓", "select"),
+            ("s", "sort"),
+            ("/", "filter"),
+            ("c", "°C/°F"),
+            ("a", "scale"),
+            ("t", "temps only" if not self.temps_only else "all"),
+            ("z", "hide dead" if self.show_dead else f"dead ({self.hidden})"),
+            ("h", "what is hidden"),
+            ("x", "hide sensor"),
+            ("d", "dedupe" if not self.hide_dupes else "show duplicates"),
+            ("w", f"window {self.window_label()}"),
+            ("u", "history" if self.dual else "chip panel"),
+            ("W", "save config"),
+            ("+/-", f"{self.interval:g}s"),
+            ("r", "reset"),
+            ("␣", "pause"),
+            ("?", "help"),
+            ("q", "quit"),
+        ]
+        x = 1
+        for k, desc in keys:
+            if x + len(k) + len(desc) + 3 > w:
+                break
+            safe_addstr(win, y, x, k, th.c(P_SEL) | curses.A_BOLD)
+            x += len(k)
+            safe_addstr(win, y, x, f" {desc}", th.c(P_DIM))
+            x += len(desc) + 2
+
+    def draw_help(self, win, h, w) -> None:
+        th = self.theme
+        lines = [
+            ("↑ / ↓ / j / k", "select a sensor"),
+            ("PgUp / PgDn", "scroll by 10"),
+            ("Home / End", "first / last sensor"),
+            ("s", "sort: chip -> value -> name"),
+            ("/", "filter by sensor or chip name"),
+            ("c", "toggle °C / °F"),
+            ("a", "chart scale: limit/reference <-> auto"),
+            ("t", "show temperatures only / everything"),
+            ("z", "show the dead sensors too"),
+            ("h", "list of hidden sensors with the reason"),
+            ("x", "hide / unhide the selected sensor"),
+            ("d", "hide duplicates (the same measurement from two chips)"),
+            ("w", "history window: sample -> 30 s -> 5 min"),
+            ("u", "chip panel: temperatures ▲ / fan speeds ▼"),
+            ("W", "save the settings and the hidden list to config.toml"),
+            ("+ / -", "refresh interval (0.5-60 s)"),
+            ("r", "reset min/max and the history"),
+            ("space", "pause the readings"),
+            ("q / Esc", "quit"),
+        ]
+        bw = min(w - 4, 58)
+        bh = len(lines) + 4
+        by = max(0, (h - bh) // 2)
+        bx = max(0, (w - bw) // 2)
+        for i in range(bh):
+            safe_addstr(win, by + i, bx, " " * bw, th.c(P_TEXT))
+        draw_box(win, by, bx, bh, bw, "help - sensortop", th)
+        for i, (k, d) in enumerate(lines):
+            safe_addstr(win, by + 1 + i, bx + 2, k.rjust(14), th.c(P_SEL) | curses.A_BOLD)
+            safe_addstr(win, by + 1 + i, bx + 18, d[: bw - 20], th.c(P_TEXT))
+        safe_addstr(
+            win,
+            by + bh - 2,
+            bx + 2,
+            "any key - back",
+            th.c(P_DIM),
+        )
+
+
+def ratio_scale(r: Reading, hi: float) -> float:
+    """Rescales the chart gradient so a 'cold' sensor is not entirely red."""
+    if r.kind != "temp":
+        return 1.0
+    top, _src = temp_top(r)
+    return clamp(hi / (top or TEMP_SCALE_FALLBACK), 0.25, 1.0)
+
+
+# ---------------------------------------------------------------------------
+# One-off mode (no TUI)
+# ---------------------------------------------------------------------------
+
+ANSI = {
+    "reset": "\033[0m",
+    "bold": "\033[1m",
+    "dim": "\033[2m",
+}
+
+
+def once(source, args, cfg: Optional[Config] = None) -> int:
+    data = source.read()
+    if not data:
+        print("no readings from `sensors`", file=sys.stderr)
+        return 1
+    app = App(source, args, cfg)
+    app.ingest(data)  # a single sample: the floor, the aliases, the [hidden] rules
+    # with one sample the zero, physical-range, read-error and manual-hide rules
+    # all work; duplicate detection needs history, so it drops out
+    hidden = {r.key: why for r in app.readings if (why := app.dead(r))}
+    data = [r for r in app.readings if args.show_dead or r.key not in hidden]
+
+    if args.json:
+        print(json.dumps(json_dump(app, data, hidden), ensure_ascii=False, indent=2))
+        return 0
+
+    color = sys.stdout.isatty() and not args.mono
+    heat = [82, 118, 154, 190, 226, 220, 214, 208, 202, 196]
+    cool = [25, 26, 32, 38, 44, 45, 45, 51, 51, 87]
+
+    def paint(s: str, ratio: float, palette="heat", bold=False) -> str:
+        if not color:
+            return s
+        pal = heat if palette == "heat" else cool
+        c = pal[int(clamp(ratio, 0, 1) * (len(pal) - 1) + 0.5)]
+        b = ANSI["bold"] if bold else ""
+        return "\033[38;5;%dm%s%s%s" % (c, b, s, ANSI["reset"])
+
+    chips: dict[str, list[Reading]] = {}
+    for r in data:
+        chips.setdefault(r.chip, []).append(r)
+    width = min(os.get_terminal_size().columns if sys.stdout.isatty() else 80, 100)
+    bar_w = max(10, width - 48)
+    for chip, lst in chips.items():
+        alias = app.namer.alias(chip)
+        head = f"{alias}  ({chip})"
+        print(f"\033[1;36m{alias}{ANSI['reset']}  \033[2m({chip}){ANSI['reset']}" if color else head)
+        for r in sorted(lst, key=lambda r: (KIND_ORDER.get(r.kind, 9), r.label)):
+            st = app.stats.setdefault(r.key, Stats())
+            pal = palette_of(r)
+            ratio = ratio_of(r, st, app.refs)
+            if ratio is None:
+                bar = " " * bar_w  # no reference - draw nothing
+            else:
+                n = int(ratio * bar_w)
+                bar = paint("█" * n + "·" * (bar_w - n), ratio, pal)
+            lim = ""
+            if r.crit is not None:
+                lim = f"  crit {app.fmt(r, r.crit).strip()}"
+            elif r.high is not None:
+                lim = f"  high {app.fmt(r, r.high).strip()}"
+            if r.kind == "temp":
+                val = paint(app.fmt(r), ratio or 0.0, pal, bold=True)
+            else:
+                val = f"{ANSI['bold']}{app.fmt(r)}{ANSI['reset']}" if color else app.fmt(r)
+            dim, rst = (ANSI["dim"], ANSI["reset"]) if color else ("", "")
+            print(f"  {r.label[:20]:<20} {bar} {val}{dim}{lim}{rst}")
+        print()
+    return 0
+
+
+ALARM_NAMES = ["ok", "warn", "crit"]
+
+
+def json_dump(app: "App", data: list[Reading], hidden: dict) -> dict:
+    """A normalised dump for alerting: the readings + limit and state context."""
+    temps = [r for r in data if r.kind == "temp" and r.valid]
+    lo, hi = app.range_now()
+    sensors = []
+    for r in data:
+        st = app.stats.setdefault(r.key, Stats())
+        sensors.append(
+            {
+                "chip": r.chip,
+                "alias": app.namer.alias(r.chip),
+                "adapter": r.adapter,
+                "label": r.label,
+                "name": app.namer.qualified(r),
+                "kind": r.kind,
+                "value": None if math.isnan(r.value) else r.value,
+                "unit": r.unit,
+                "pretty": app.fmt(r).strip(),
+                "high": r.high,
+                "crit": r.crit,
+                "low": r.low,
+                "ratio": ratio_of(r, st, app.refs),
+                "state": ALARM_NAMES[alarm_level(r)],
+                "hidden": hidden.get(r.key),
+                "error": r.error,
+            }
+        )
+    hottest = max(temps, key=lambda r: r.value, default=None)
+    return {
+        "host": app.host,
+        "time": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "unix": int(time.time()),
+        "temp_range": {"min": lo, "max": hi, "auto": app.temp_range[0] is None},
+        "summary": {
+            "sensors": len(sensors),
+            "temps": len(temps),
+            "hidden": len(hidden),
+            "warn": sum(1 for r in data if alarm_level(r) > 0),
+            "max_temp": (
+                None
+                if hottest is None
+                else {"name": app.namer.qualified(hottest), "value": hottest.value}
+            ),
+            "avg_temp": (
+                round(sum(r.value for r in temps) / len(temps), 2) if temps else None
+            ),
+        },
+        "sensors": sensors,
+    }
+
+
+def write_config(source, path: str) -> int:
+    """Writes a config template with the detected chips - ready to edit."""
+    if os.path.exists(path):
+        print(f"File {path} already exists - not overwriting.", file=sys.stderr)
+        return 1
+    data = source.read()
+    namer = ChipNamer()
+    chips = list(dict.fromkeys(r.chip for r in data))
+    namer.rebuild(chips)
+    cfg = Config(
+        path=path,
+        aliases=detected_aliases(namer, chips),
+        priorities=list(DEFAULT_PRIORITIES),
+    )
+    cfg.alias_notes = {
+        chip: ", ".join(sorted({r.kind for r in data if r.chip == chip})) for chip in chips
+    }
+    try:
+        cfg.save()
+    except OSError as exc:
+        print(f"Could not save {path}: {exc.strerror or exc}", file=sys.stderr)
+        return 1
+    print(f"Saved {path} ({len(chips)} chips). Edit it and run again.")
+    return 0
+
+
+def parse_temp_range(text: str) -> tuple[Optional[float], float]:
+    """'auto:130' -> (None, 130.0); '12:130' -> (12.0, 130.0). None = dynamic floor."""
+    lo_s, _, hi_s = str(text).partition(":")
+    lo_s, hi_s = lo_s.strip().lower(), hi_s.strip()
+    lo = None if lo_s in ("auto", "") else float(lo_s)
+    hi = float(hi_s) if hi_s else TEMP_PHYSICAL[1]
+    if lo is not None and lo >= hi:
+        raise ValueError("MIN >= MAX")
+    return lo, hi
+
+
+# config key name -> argparse field name (where they differ)
+CFG_TO_ARG = {"range": "temp_range"}
+
+
+def resolve_settings(args, cfg: Config) -> None:
+    """Order of precedence: CLI flag > config.toml > built-in value."""
+    for section, spec in ((cfg.ui, UI_SETTINGS), (cfg.temps, TEMP_SETTINGS)):
+        for key, (_typ, default) in spec.items():
+            dest = CFG_TO_ARG.get(key, key)
+            if getattr(args, dest, None) is None:
+                setattr(args, dest, section.get(key, default))
+
+
+# ---------------------------------------------------------------------------
+
+
+def set_proc_name(name: str = "sensortop") -> None:
+    """Rename the process itself.
+
+    Terminals such as Konsole label the tab with the name of the foreground
+    process (/proc/<pid>/comm), which for a script is `python3` - that is why
+    setting the window title alone is not enough. `setproctitle` (optional)
+    additionally fixes what `ps` and `pgrep` show.
+    """
+    try:
+        import ctypes
+
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        buf = ctypes.create_string_buffer(name.encode()[:15])  # comm is 16 bytes
+        libc.prctl(15, ctypes.byref(buf), 0, 0, 0)  # 15 = PR_SET_NAME
+    except Exception:
+        pass
+    try:
+        import setproctitle  # type: ignore
+
+        setproctitle.setproctitle(name)
+    except Exception:
+        pass
+
+
+def set_term_title(title: str) -> None:
+    """Name the terminal window/tab (otherwise it shows just `python`)."""
+    if not sys.stdout.isatty() or os.environ.get("TERM", "dumb") == "dumb":
+        return
+    try:
+        sys.stdout.write("\033[22;0t")           # push the current title
+        sys.stdout.write(f"\033]0;{title}\007")  # set icon name + window title
+        sys.stdout.flush()
+    except OSError:
+        pass
+
+
+def restore_term_title() -> None:
+    """Put back the title that was on screen before we took over."""
+    if not sys.stdout.isatty() or os.environ.get("TERM", "dumb") == "dumb":
+        return
+    try:
+        sys.stdout.write("\033[23;0t")  # pop the saved title
+        sys.stdout.flush()
+    except OSError:
+        pass
+
+
+# ---------------------------------------------------------------------------
+
+
+def main(argv=None) -> int:
+    set_proc_name("sensortop")
+    ap = argparse.ArgumentParser(
+        prog="sensortop",
+        description="A btop-style temperature monitor built on lm-sensors.",
+    )
+    # Flags with no default (None) are filled in from config.toml - otherwise
+    # "not given" could not be told apart from "given the default value".
+    ap.add_argument(
+        "-i",
+        "--interval",
+        type=float,
+        default=None,
+        help="refresh interval in seconds (default 2)",
+    )
+    ap.add_argument(
+        "-f",
+        "--fahrenheit",
+        action="store_true",
+        default=None,
+        help="temperatures in degrees Fahrenheit",
+    )
+    ap.add_argument(
+        "-t",
+        "--temps-only",
+        action="store_true",
+        default=None,
+        help="show temperature sensors only",
+    )
+    ap.add_argument(
+        "-s",
+        "--sort",
+        choices=SORTS,
+        default=None,
+        help="list order: chip / value / name (default chip)",
+    )
+    ap.add_argument(
+        "-1",
+        "--once",
+        action="store_true",
+        help="a one-off dump instead of the TUI (text, or JSON on stdout with --json)",
+    )
+    ap.add_argument(
+        "--json",
+        action="store_true",
+        help="normalised JSON on stdout; implies --once (for alerting)",
+    )
+    ap.add_argument(
+        "--mono", action="store_true", default=None, help="monochrome mode (no colours)"
+    )
+    ap.add_argument(
+        "--ascii",
+        action="store_true",
+        default=None,
+        help="ASCII charts instead of braille (braille by default, with "
+        "autodetection - on a terminal without U+28FF the fallback turns itself on)",
+    )
+    ap.add_argument(
+        "--demo", action="store_true", help="synthetic data - a look at the UI without lm-sensors"
+    )
+    ap.add_argument(
+        "-z",
+        "--show-dead",
+        action="store_true",
+        default=None,
+        help="do not hide the dead sensors (constant 0, out of range, hidden manually)",
+    )
+    ap.add_argument(
+        "--hide-stale",
+        action="store_true",
+        default=None,
+        help="an extra criterion: hide sensors unchanged for N samples "
+        "(off by default - a stable reading is usually a working sensor)",
+    )
+    ap.add_argument(
+        "--dead-after",
+        type=int,
+        default=None,
+        metavar="N",
+        help="how many identical samples count as 'unchanged' for --hide-stale "
+        "(default 20)",
+    )
+    ap.add_argument(
+        "--temp-range",
+        default=None,
+        metavar="MIN:MAX",
+        help="the temperature range considered possible; MIN=auto computes the "
+        "floor from the trustworthy sensors (default auto:130)",
+    )
+    ap.add_argument(
+        "--floor-margin",
+        type=float,
+        default=None,
+        metavar="°C",
+        help="how many degrees below the coldest trustworthy sensor the floor "
+        f"lands with MIN=auto (default {TEMP_FLOOR_MARGIN:g})",
+    )
+    ap.add_argument(
+        "-d",
+        "--hide-duplicates",
+        action="store_true",
+        default=None,
+        help="hide sensors measuring the same thing as another chip (e.g. TSI0_TEMP = Tctl); "
+        f"detection needs at least {DUPE_MIN_SAMPLES} samples, so it works in the TUI, not in --once",
+    )
+    ap.add_argument(
+        "--hwmon-root",
+        default="/sys/class/hwmon",
+        help="the hwmon directory holding the reference points (power1_cap, pp_dpm_*)",
+    )
+    ap.add_argument(
+        "--config",
+        default=CONFIG_PATH,
+        help=f"the configuration file (default {CONFIG_PATH})",
+    )
+    ap.add_argument(
+        "--write-config",
+        action="store_true",
+        help="write a config template for the detected chips and exit",
+    )
+    ap.add_argument(
+        "--sensors-arg",
+        action="append",
+        default=[],
+        help="an extra argument passed to `sensors` (may be repeated)",
+    )
+    ap.add_argument("-V", "--version", action="version", version=f"sensortop {VERSION}")
+    args = ap.parse_args(argv)
+
+    cfg = Config.load(args.config)
+    if cfg.error:
+        print(f"⚠ {cfg.error}", file=sys.stderr)
+    resolve_settings(args, cfg)
+
+    args.interval = max(0.2, args.interval)
+    try:
+        args.temp_range = parse_temp_range(args.temp_range)
+    except ValueError:
+        ap.error("--temp-range expects MIN:MAX or auto:MAX, e.g. auto:130")
+    source = DemoSource() if args.demo else SensorSource(args.sensors_arg)
+
+    err = source.available()
+    if err:
+        print(err, file=sys.stderr)
+        print("Hint: run `sensortop --demo` to see the interface.", file=sys.stderr)
+        return 2
+
+    if args.write_config:
+        return write_config(source, args.config)
+
+    if args.once or args.json:
+        return once(source, args, cfg)
+
+    app = App(source, args, cfg)
+    set_term_title("sensortop")
+    try:
+        curses.wrapper(app.run)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        restore_term_title()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

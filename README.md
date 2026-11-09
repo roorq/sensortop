@@ -1,4 +1,4 @@
-# sensortop
+# 🌡️ sensortop
 
 A `btop`-style terminal temperature monitor built on `lm-sensors`. One file,
 plain Python 3.8+, no external dependencies (only `curses` from the standard
@@ -21,7 +21,14 @@ configuration is skipped with a warning and everything else keeps working).
 Temperatures get the alarm palette; fan speeds, frequencies and voltages get a
 cool one, because `4485 RPM` or `1.240 V` is not an emergency.
 
-## Features
+## Quick start
+
+```bash
+sudo apt install lm-sensors   # Debian/Ubuntu
+./sensortop                   # or ./sensortop --demo to try it without sensors
+```
+
+## What does it do?
 
 - **The scale comes from fixed reference points, not from the session history** —
   a bar does not suggest an alarm where there is none, and it makes sense from
@@ -91,7 +98,7 @@ cool one, because `4485 RPM` or `1.240 V` is not an emergency.
   within 0.5 °C for the whole session, so they get flagged as one measurement
   even though they are physically different. The thresholds live in
   `DUPE_TOLERANCE` / `DUPE_AGREEMENT` / `DUPE_MIN_SAMPLES` at the top of
-  `sensortop.py`.
+  `sensortop`.
 
   A sensor's identity is `(adapter, chip, label)` — the label alone identifies
   nothing, because every RAM stick and every PHY carries a `temp1`.
@@ -230,28 +237,53 @@ To check: `sensors -j` should print JSON. With older lm-sensors versions
 ## Running it
 
 ```bash
-./sensortop.py                 # TUI, refresh every 2 s
-./sensortop.py -i 1 -t         # every 1 s, temperature sensors only
-./sensortop.py --demo          # synthetic data - a look without lm-sensors
-./sensortop.py -1              # a one-off text dump
-./sensortop.py -1 --json       # normalised JSON on stdout (--json implies -1)
-./sensortop.py -f              # degrees Fahrenheit
-./sensortop.py -z              # do not hide dead or manually hidden sensors
-./sensortop.py --temp-range=12:130   # a fixed floor instead of a computed one
-./sensortop.py --floor-margin 6      # tighter around the coldest sensor
-./sensortop.py --hide-stale    # additionally hide unchanging readings
-./sensortop.py -d              # hide duplicate measurements
-./sensortop.py -s value        # the list sorted by reading
-./sensortop.py --ascii         # ASCII charts instead of braille
-./sensortop.py --write-config  # a config.toml template with the detected chips
-./sensortop.py --sensors-arg -f --sensors-arg coretemp-isa-0000   # arguments for `sensors`
+./sensortop                 # TUI, refresh every 2 s
+./sensortop -i 1 -t         # every 1 s, temperature sensors only
+./sensortop --demo          # synthetic data - a look without lm-sensors
+./sensortop -1              # a one-off text dump
+./sensortop -1 --json       # normalised JSON on stdout (--json implies -1)
+./sensortop -f              # degrees Fahrenheit
+./sensortop -z              # do not hide dead or manually hidden sensors
+./sensortop --temp-range=12:130   # a fixed floor instead of a computed one
+./sensortop --floor-margin 6      # tighter around the coldest sensor
+./sensortop --hide-stale    # additionally hide unchanging readings
+./sensortop -d              # hide duplicate measurements
+./sensortop -s value        # the list sorted by reading
+./sensortop --ascii         # ASCII charts instead of braille
+./sensortop --write-config  # a config.toml template with the detected chips
+./sensortop --sensors-arg=-f --sensors-arg=coretemp-isa-0000   # arguments for `sensors`
 ```
 
 Installing into `PATH`:
 
 ```bash
-install -Dm755 sensortop.py ~/.local/bin/sensortop
+install -Dm755 sensortop ~/.local/bin/sensortop
 ```
+
+## Options
+
+| option | meaning | default |
+|---|---|---|
+| `-i`, `--interval N` | refresh interval in seconds | `2` |
+| `-f`, `--fahrenheit` | temperatures in °F | off |
+| `-t`, `--temps-only` | temperature sensors only | off |
+| `-s`, `--sort chip\|value\|name` | list order | `chip` |
+| `-1`, `--once` | a one-off dump instead of the TUI | off |
+| `--json` | normalised JSON on stdout (implies `--once`) | off |
+| `--mono` | no colours | off |
+| `--ascii` | ASCII charts instead of braille | autodetected |
+| `--demo` | synthetic data, no `lm-sensors` needed | off |
+| `-z`, `--show-dead` | do not hide dead or manually hidden sensors | off |
+| `--hide-stale` | also hide sensors unchanged for N samples | off |
+| `--dead-after N` | the N for `--hide-stale` | `20` |
+| `--temp-range MIN:MAX` | possible temperatures; `MIN=auto` computes the floor | `auto:130` |
+| `--floor-margin N` | degrees below the coldest trusted sensor for `MIN=auto` | `10` |
+| `-d`, `--hide-duplicates` | hide the same measurement from a second chip | off |
+| `--hwmon-root DIR` | the hwmon directory with reference points | `/sys/class/hwmon` |
+| `--config FILE` | the configuration file | `~/.config/sensortop/config.toml` |
+| `--write-config` | write a config template and exit | - |
+| `--sensors-arg=ARG` | an extra argument for `sensors` (repeatable; use `=` for values starting with `-`) | none |
+| `-V`, `--version` | print the version | - |
 
 ## Configuration
 
@@ -261,7 +293,7 @@ defaults and a one-off switch still wins. The `W` key in the TUI saves the
 current state; for a template with the detected chips:
 
 ```bash
-./sensortop.py --write-config      # writes ~/.config/sensortop/config.toml
+./sensortop --write-config      # writes ~/.config/sensortop/config.toml
 ```
 
 ```toml
@@ -310,7 +342,9 @@ removed. The value and the limit only decide within a class.
 
 Saving rewrites the whole file, so your own comments in it do not survive `W`.
 The old `aliases.conf` is still read when `config.toml` has no `[aliases]`
-section — nothing has to be rewritten by hand.
+section — nothing has to be rewritten by hand. A `.conf` file passed to
+`--config` is read-only: `W` and `--write-config` refuse to write to it, because
+it can hold only aliases. Use a `.toml` path to save settings.
 
 ### Chip aliases
 
@@ -351,7 +385,7 @@ own names.
 
 ## JSON for alerting
 
-`./sensortop.py -1 --json` prints an object with a header and a list of sensors
+`./sensortop -1 --json` prints an object with a header and a list of sensors
 on stdout:
 
 ```json
@@ -386,20 +420,20 @@ mode.
 
 ```bash
 # the hottest sensor in the system
-./sensortop.py --json | jq -r '.summary.max_temp | "\(.name) \(.value)°C"'
+./sensortop --json | jq -r '.summary.max_temp | "\(.name) \(.value)°C"'
 
 # a cron entry: alarm when anything exceeds the driver's limit
-./sensortop.py --json | jq -e '[.sensors[]|select(.state!="ok")]|length==0' >/dev/null \
+./sensortop --json | jq -e '[.sensors[]|select(.state!="ok")]|length==0' >/dev/null \
   || echo "ALARM: overheating" | mail -s "temp" root
 
 # for Zabbix / a database: flat name=value pairs
-./sensortop.py --json | jq -r '.sensors[]|select(.kind=="temp")|"\(.name)=\(.value)"'
+./sensortop --json | jq -r '.sensors[]|select(.kind=="temp")|"\(.name)=\(.value)"'
 ```
 
 ## Tests
 
 ```bash
-python3 test_parsers.py     # 145 tests: parsers, scaling, sysfs, aliases, limits,
+python3 test_parsers.py     # 172 tests: parsers, scaling, sysfs, aliases, limits,
                             # dead sensors, duplicates, config, renderers,
                             # the ring buffer, window aggregation, the dual-axis panel
 ```
@@ -414,17 +448,18 @@ Reading the reference points from `/sys` is tested against a synthetic hwmon tre
 (`power1_cap`, `pp_dpm_sclk`, the `device` symlinks for PCI and I²C), including a
 regression for "a few samples must not produce nothing but full bars".
 
-To see the whole interface without any hardware: `./sensortop.py --demo` — the
+To see the whole interface without any hardware: `./sensortop --demo` — the
 synthetic data mirrors a typical AM5 desktop (two `amdgpu` chips, two `spd5118`
 sticks at 37.8 and 38.0 °C, the NIC PHY, `AUXTIN*` below ambient, the dead
 `nct6799` sensors), that is, exactly the cases that are easy to get wrong.
 
-## Implementation notes
+## Notes
 
 - Reading: `sensors -j` → JSON; a fallback to text parsing when JSON is
-  unavailable or damaged (some drivers spit out `nan`). In text mode, values like
-  `1.44 GHz` are normalised back to Hz, so the data model is identical on both
-  paths.
+  unavailable or damaged (some drivers spit out `nan`). A failure after JSON has
+  worked affects only that sample; text mode becomes permanent only after three
+  failures with no successful JSON read. In text mode, values like `1.44 GHz` are
+  normalised back to Hz, so the data model is identical on both paths.
 - The sensor kind is recognised from the key prefix (`temp1_input`, `fan2_input`,
   `freq1_input`, `in0_input`, `power1_average`, `curr1_input`).
 - Limits outside a sane range are rejected (`temp` outside −50…250 °C, `in`
@@ -447,3 +482,13 @@ sticks at 37.8 and 38.0 °C, the NIC PHY, `AUXTIN*` below ambient, the dead
 - Drawing goes through `curses` with a safe `addstr` (no exceptions at the screen
   edges) and full `KEY_RESIZE` handling; below 84 columns the right panel is
   hidden, and below 40×8 only a message is shown.
+
+## Reverting
+
+sensortop only reads sensors; it changes no system settings. The only files it
+writes are the configuration (on `W` or `--write-config`). To remove everything:
+
+```bash
+rm -f ~/.local/bin/sensortop      # if you installed it into PATH
+rm -rf ~/.config/sensortop        # saved settings, aliases and the hidden list
+```
